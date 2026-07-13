@@ -4,6 +4,7 @@
   lib,
   pkgs,
   self,
+  utils,
   ...
 }:
 let
@@ -122,7 +123,7 @@ let
         Group = mount.group;
         UMask = "0027";
         EnvironmentFile = lib.optional (mount.environmentFile != null) mount.environmentFile;
-        ExecStart = lib.escapeShellArgs (
+        ExecStart = utils.escapeSystemdExecArgs (
           [
             (lib.getExe cfg.package)
             "mount"

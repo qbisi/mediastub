@@ -27,7 +27,7 @@
               services.mediastub = {
                 enable = true;
                 mounts.check = {
-                  remote = "file:///tmp";
+                  remote = "http+unix://%2Frun%2Fopenlist%2Fsocket/dav/media";
                   mountPoint = "/run/mediastub-check";
                   consumers = [ "media-server.service" ];
                   options = [
@@ -72,6 +72,7 @@
             test -f "$unit"
             ${pkgs.gnugrep}/bin/grep -Fq "User=mediastub" "$unit"
             ${pkgs.gnugrep}/bin/grep -Fq -- "--allow-other" "$unit"
+            ${pkgs.gnugrep}/bin/grep -Fq "http+unix://%%2Frun%%2Fopenlist%%2Fsocket/dav/media" "$unit"
             ${pkgs.gnugrep}/bin/grep -Fq "Before=media-server.service" "$unit"
             touch "$out"
           '';
