@@ -9,22 +9,26 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/qbisi/mediastub/core"
+	"github.com/qbisi/mediastub/internal/sdnotify"
 	"github.com/qbisi/mediastub/mountfs"
 	"github.com/qbisi/mediastub/origin"
+	"github.com/qbisi/mediastub/pathfilter"
+	"github.com/qbisi/mediastub/syncer"
 )
 
-const defaultIncludes = "*.mkv,*.mka,*.mks,*.webm,*.mp4,*.m4v,*.mov"
+const defaultIncludes = pathfilter.DefaultIncludes
 
 const (
 	webDAVUserEnv     = "WEBDAV_USER"
 	webDAVPasswordEnv = "WEBDAV_PASSWORD"
+	webDAVTokenEnv    = "WEBDAV_TOKEN"
 )
 
 type byteSize int64
@@ -86,6 +90,35 @@ type mountOptions struct {
 	attrTTL      time.Duration
 }
 
+type syncOptions struct {
+	include      string
+	pollInterval time.Duration
+	settleTime   time.Duration
+	stateDir     string
+	logLevel     string
+	once         bool
+}
+
+func (o syncOptions) validate() error {
+	if o.stateDir == "" {
+		return errors.New("--state-dir is required")
+	}
+	if !filepath.IsAbs(o.stateDir) {
+		return errors.New("--state-dir must be absolute")
+	}
+	if o.pollInterval <= 0 {
+		return errors.New("--poll-interval must be positive")
+	}
+	if o.settleTime <= 0 {
+		return errors.New("--settle-time must be positive")
+	}
+	if o.logLevel != "info" && o.logLevel != "verbose" && o.logLevel != "debug" {
+		return errors.New("--log-level must be info, verbose or debug")
+	}
+	_, err := pathfilter.New(includes(o.include))
+	return err
+}
+
 func (o mountOptions) validate() error {
 	if o.maxRequests <= 0 {
 		return errors.New("--probe-max-requests must be positive")
@@ -102,9 +135,9 @@ func (o mountOptions) validate() error {
 	if _, err := mountfs.ParseLogLevel(o.logLevel); err != nil {
 		return fmt.Errorf("--log-level: %w", err)
 	}
-	patterns := includes(o.stubProcess)
+	patterns := pathfilter.ParseCommaSeparated(o.stubProcess)
 	for _, pattern := range patterns {
-		if _, err := path.Match(pattern, ""); err != nil {
+		if _, err := pathfilter.New([]string{pattern}); err != nil {
 			return fmt.Errorf("invalid --stub-process pattern %q: %w", pattern, err)
 		}
 	}
@@ -123,12 +156,49 @@ func (o mountOptions) validate() error {
 }
 
 func rootUsage(w io.Writer) {
-	fmt.Fprintln(w, "Usage: mediastub mount [options] REMOTE MOUNTPOINT")
-	fmt.Fprintln(w, "Options may appear before or after REMOTE MOUNTPOINT.")
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  mediastub mount [options] REMOTE MOUNTPOINT")
+	fmt.Fprintln(w, "  mediastub sync [options] REMOTE LOCAL_DIRECTORY")
+	fmt.Fprintln(w, "Options may appear before or after positional arguments.")
 	fmt.Fprintln(w)
 	printRemoteHelp(w)
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, `Run "mediastub mount --help" for mount options.`)
+	fmt.Fprintln(w, `Run "mediastub mount --help" or "mediastub sync --help" for command options.`)
+}
+
+func parseSync(args []string, output io.Writer) (syncOptions, string, string, error) {
+	var opts syncOptions
+	flags := flag.NewFlagSet("mediastub sync", flag.ContinueOnError)
+	flags.SetOutput(output)
+	flags.StringVar(&opts.include, "include", defaultIncludes, "comma-separated path.Match patterns identifying media files")
+	flags.DurationVar(&opts.pollInterval, "poll-interval", 5*time.Minute, "interval between complete remote scans")
+	flags.DurationVar(&opts.settleTime, "settle-time", 3*time.Second, "time a local sidecar must remain unchanged")
+	flags.StringVar(&opts.stateDir, "state-dir", "", "absolute directory for state.json and the process lock (required)")
+	flags.StringVar(&opts.logLevel, "log-level", "info", "logging detail: info, verbose or debug")
+	flags.BoolVar(&opts.once, "once", false, "perform one complete reconcile and exit")
+	flags.Usage = func() {
+		fmt.Fprintln(output, "Usage: mediastub sync [options] REMOTE LOCAL_DIRECTORY")
+		fmt.Fprintln(output, "Options may appear before or after REMOTE LOCAL_DIRECTORY.")
+		fmt.Fprintln(output)
+		printRemoteHelp(output)
+		fmt.Fprintln(output)
+		fmt.Fprintln(output, "Options:")
+		flags.PrintDefaults()
+	}
+	if err := flags.Parse(interspersedFlagArgs(flags, args)); err != nil {
+		return opts, "", "", err
+	}
+	if flags.NArg() != 2 {
+		flags.Usage()
+		return opts, "", "", errors.New("sync requires exactly REMOTE and LOCAL_DIRECTORY")
+	}
+	if err := opts.validate(); err != nil {
+		return opts, "", "", err
+	}
+	if !filepath.IsAbs(flags.Arg(1)) {
+		return opts, "", "", errors.New("LOCAL_DIRECTORY must be absolute")
+	}
+	return opts, flags.Arg(0), flags.Arg(1), nil
 }
 
 func printRemoteHelp(w io.Writer) {
@@ -141,7 +211,8 @@ func printRemoteHelp(w io.Writer) {
 	fmt.Fprintln(w, "WebDAV environment:")
 	fmt.Fprintf(w, "  %s      Basic Auth username\n", webDAVUserEnv)
 	fmt.Fprintf(w, "  %s  Basic Auth password\n", webDAVPasswordEnv)
-	fmt.Fprintln(w, "  Set both variables or neither.")
+	fmt.Fprintf(w, "  %s     Bearer token (mutually exclusive with Basic Auth)\n", webDAVTokenEnv)
+	fmt.Fprintln(w, "  Set both Basic variables, only the token, or none.")
 }
 
 func parseMount(args []string, output io.Writer) (mountOptions, string, string, error) {
@@ -228,13 +299,7 @@ func interspersedFlagArgs(flags *flag.FlagSet, args []string) []string {
 }
 
 func includes(value string) []string {
-	var patterns []string
-	for _, item := range strings.Split(value, ",") {
-		if item = strings.TrimSpace(item); item != "" {
-			patterns = append(patterns, item)
-		}
-	}
-	return patterns
+	return pathfilter.ParseCommaSeparated(value)
 }
 
 func numericIDs(value, option string) ([]uint32, error) {
@@ -253,16 +318,30 @@ func numericIDs(value, option string) ([]uint32, error) {
 	return ids, nil
 }
 
-func webDAVCredentials(remote string) (string, string, error) {
+func webDAVCredentials(remote string) (origin.Auth, error) {
 	if !strings.HasPrefix(remote, "http://") && !strings.HasPrefix(remote, "https://") && !strings.HasPrefix(remote, "http+unix://") {
-		return "", "", nil
+		return origin.Auth{}, nil
 	}
 	user, userSet := os.LookupEnv(webDAVUserEnv)
 	password, passwordSet := os.LookupEnv(webDAVPasswordEnv)
 	if userSet != passwordSet {
-		return "", "", fmt.Errorf("%s and %s must be set together", webDAVUserEnv, webDAVPasswordEnv)
+		return origin.Auth{}, fmt.Errorf("%s and %s must be set together", webDAVUserEnv, webDAVPasswordEnv)
 	}
-	return user, password, nil
+	token, tokenSet := os.LookupEnv(webDAVTokenEnv)
+	if userSet && (user == "" || password == "") {
+		return origin.Auth{}, errors.New("WebDAV Basic credentials must not be empty")
+	}
+	if tokenSet && token == "" {
+		return origin.Auth{}, errors.New("WEBDAV_TOKEN must not be empty")
+	}
+	auth := origin.Auth{User: user, Password: password}
+	if tokenSet {
+		auth.BearerToken = token
+	}
+	if err := auth.Validate(); err != nil {
+		return origin.Auth{}, err
+	}
+	return auth, nil
 }
 
 func mountCommand(args []string) error {
@@ -278,11 +357,11 @@ func mountCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	user, password, err := webDAVCredentials(remote)
+	auth, err := webDAVCredentials(remote)
 	if err != nil {
 		return err
 	}
-	upstream, err := origin.NewRemote(remote, user, password)
+	upstream, err := origin.NewRemoteWithAuth(remote, auth)
 	if err != nil {
 		return err
 	}
@@ -333,6 +412,39 @@ func mountCommand(args []string) error {
 	return nil
 }
 
+func syncCommand(args []string) error {
+	opts, remote, localDirectory, err := parseSync(args, os.Stderr)
+	if err != nil {
+		return err
+	}
+	auth, err := webDAVCredentials(remote)
+	if err != nil {
+		return err
+	}
+	upstream, err := origin.NewRemoteWithAuth(remote, auth)
+	if err != nil {
+		return err
+	}
+	defer upstream.Close()
+	logger := log.New(os.Stderr, "mediastub: ", log.LstdFlags|log.Lmicroseconds)
+	service, err := syncer.New(upstream, syncer.Config{
+		Remote: remote, LocalRoot: localDirectory, StateDir: opts.stateDir,
+		Includes: includes(opts.include), PollInterval: opts.pollInterval,
+		SettleTime: opts.settleTime, LogLevel: opts.logLevel, Once: opts.once,
+		Budget: core.DefaultBudget, Logger: logger,
+	})
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	logger.Printf("synchronizing remote=%q local_directory=%q", remote, localDirectory)
+	return service.Run(ctx, func(status string) error {
+		logger.Printf("ready: %s", status)
+		return sdnotify.Ready(status)
+	})
+}
+
 func run(args []string) error {
 	if len(args) == 0 {
 		rootUsage(os.Stderr)
@@ -341,6 +453,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "mount":
 		return mountCommand(args[1:])
+	case "sync":
+		return syncCommand(args[1:])
 	case "help", "-h", "--help":
 		rootUsage(os.Stdout)
 		return nil

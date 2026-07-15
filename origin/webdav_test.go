@@ -121,6 +121,73 @@ func TestWebDAVRejectsWrongContentRange(t *testing.T) {
 	}
 }
 
+func TestWebDAVBearerPutAndStat(t *testing.T) {
+	var content []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer secret-token" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			content, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusCreated)
+		case "PROPFIND":
+			w.WriteHeader(http.StatusMultiStatus)
+			fmt.Fprint(w, multiStatus(davResponseXML("/dav/movie.nfo", false, len(content))))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+	webdav, err := NewWebDAVWithAuth(server.URL+"/dav/", Auth{BearerToken: "secret-token"}, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte("<movie/>")
+	entry, err := webdav.Put(context.Background(), "movie.nfo", strings.NewReader(string(want)), int64(len(want)), "application/xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(content) != string(want) || entry.Size != int64(len(want)) {
+		t.Fatalf("content=%q entry=%+v", content, entry)
+	}
+}
+
+func TestWebDAVRedirectDoesNotForwardAuthorization(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			t.Errorf("redirect target received Authorization %q", auth)
+		}
+		w.Header().Set("Content-Range", "bytes 0-2/3")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = io.WriteString(w, "abc")
+	}))
+	defer target.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer source-token" {
+			t.Errorf("source missing Bearer token")
+		}
+		http.Redirect(w, r, target.URL+"/object", http.StatusFound)
+	}))
+	defer source.Close()
+	webdav, err := NewWebDAVWithAuth(source.URL+"/", Auth{BearerToken: "source-token"}, source.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	object, err := webdav.Open(context.Background(), Entry{Path: "movie.mkv", Size: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 3)
+	if _, err := object.ReadAt(context.Background(), buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "abc" {
+		t.Fatalf("body = %q", buf)
+	}
+}
+
 func TestSanitizeURLErrorRedactsSignedQuery(t *testing.T) {
 	cause := errors.New("transport failed")
 	err := sanitizeURLError(&url.Error{

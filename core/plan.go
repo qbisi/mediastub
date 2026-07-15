@@ -50,6 +50,15 @@ func NewPlan(size int64, extents []Extent) (*Plan, error) {
 // Size returns the logical sparse-file size.
 func (p *Plan) Size() int64 { return p.logicalSize }
 
+// Extents returns a deep copy of the real byte ranges in the sparse plan.
+func (p *Plan) Extents() []Extent {
+	extents := make([]Extent, len(p.extents))
+	for i, extent := range p.extents {
+		extents[i] = Extent{Offset: extent.Offset, Data: append([]byte(nil), extent.Data...)}
+	}
+	return extents
+}
+
 // ReadAt reads metadata extents and fills every other byte with zero.
 func (p *Plan) ReadAt(b []byte, off int64) (int, error) {
 	if off < 0 {

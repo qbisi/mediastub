@@ -1,10 +1,16 @@
 # mediastub
 
-`mediastub` is a small, standalone, read-only FUSE filesystem. It presents a
-local directory or WebDAV collection while replacing selected Matroska and MP4
-objects with sparse metadata-only views. The projected files keep their
-original logical size and the container metadata used by scanners such as
-Jellyfin; media payload bytes read from a stub are zero.
+`mediastub` provides two independent ways to expose metadata-only media files
+from a local directory or WebDAV collection:
+
+- `mediastub mount` is a process-aware, read-only FUSE projection with stub and
+  passthrough views;
+- `mediastub sync` creates ordinary sparse files locally and synchronizes
+  Jellyfin sidecars back to the remote.
+
+Both modes keep the original media logical size and the container metadata used
+by scanners such as Jellyfin; payload bytes in a stub are sparse zero-filled
+holes.
 
 It does not import rclone. The boundary between the media logic and an upstream
 is only a sized `ReaderAt`, so another process or backend can be added without
@@ -12,7 +18,8 @@ changing the probe implementation.
 
 ## Build
 
-Go 1.24 or newer and a working FUSE 3 installation are required.
+Go 1.24 or newer is required. FUSE 3 is required only for `mount`; `sync` does
+not use FUSE.
 
 ```sh
 go build -o ./bin/mediastub ./cmd/mediastub
@@ -48,8 +55,8 @@ the package from a NixOS flake:
 }
 ```
 
-The module always adds the package overlay. It can also manage one systemd
-service per mount:
+The module always adds the package overlay. It can manage mount and sync
+services independently:
 
 ```nix
 { config, ... }:
@@ -61,12 +68,23 @@ service per mount:
       mountPoint = "/data/H-Enc";
       environmentFile = config.sops.secrets.mediastub-h-enc.path;
       consumers = [ "jellyfin.service" ];
+      include = [ "*.mkv" "*.mp4" ];
       options = [
         "--allow-other"
-        "--include=*.mkv,*.mp4"
         "--stub-process=ffprobe"
         "--log-level=info"
       ];
+    };
+
+    syncs.movies = {
+      remote = "https://drive.example/dav/movies";
+      localDirectory = "/srv/media/movies";
+      environmentFile = config.sops.secrets.mediastub-movies.path;
+      consumers = [ "jellyfin.service" ];
+      group = "media";
+      include = [ "*.mkv" "*.mp4" ];
+      pollInterval = 300;
+      settleTime = 3;
     };
   };
 }
@@ -83,13 +101,29 @@ mount.
 `--allow-other=true`) also enables `programs.fuse.userAllowOther`; this is
 normally required when a consumer runs as a different user.
 
-`environmentFile` is read at runtime by systemd and must contain both WebDAV
-variables when authentication is required:
+`include` is shared by mount and sync and renders one `--include` argument. A
+mount cannot combine typed `include` with a raw `--include` in `options`.
+Sync services run as `mediastub:mediastub` by default, use `Type=notify`, and
+allow consumers to start only after the initial reconcile. The module creates
+the private state directory, but intentionally does not create or change the
+owner/mode of `localDirectory`; create it separately and give the sync user and
+Jellyfin access through a shared group such as `media`. A sync-only
+configuration does not enable FUSE.
+
+`environmentFile` is read at runtime by systemd. Basic authentication uses:
 
 ```text
 WEBDAV_USER=alice
 WEBDAV_PASSWORD=secret
 ```
+
+Bearer authentication instead uses exactly:
+
+```text
+WEBDAV_TOKEN=secret
+```
+
+Basic and Bearer variables are mutually exclusive.
 
 Keep that file outside the Nix store, for example under `/run/secrets` using
 sops-nix or agenix. The option is unnecessary for `file://` origins and WebDAV
@@ -102,6 +136,7 @@ servers without authentication.
 
 ```text
 mediastub mount [options] REMOTE MOUNTPOINT
+mediastub sync [options] REMOTE LOCAL_DIRECTORY
 ```
 
 `REMOTE` supports these forms:
@@ -155,10 +190,11 @@ WEBDAV_PASSWORD='secret' \
   /tmp/mediastub-mount
 ```
 
-WebDAV credentials are accepted only through `WEBDAV_USER` and
-`WEBDAV_PASSWORD`; credentials embedded in a remote URL are rejected.
-Set both environment variables or neither; a partial credential configuration
-is rejected before mounting.
+WebDAV credentials are accepted only through `WEBDAV_USER` plus
+`WEBDAV_PASSWORD`, or `WEBDAV_TOKEN`; credentials embedded in a remote URL are
+rejected. Partial or mixed authentication is rejected before accessing the
+remote. Authentication headers and cookies are removed when a request is
+redirected to a different scheme or authority.
 The server must support `PROPFIND` and byte-range `GET`. Plain `http://` should
 only be used on a trusted network or through a protected local tunnel.
 For `http+unix`, WebDAV requests use the Unix socket while absolute redirects
@@ -176,6 +212,59 @@ Mount options may appear before or after `REMOTE MOUNTPOINT`, for example:
 ```sh
 mediastub mount REMOTE MOUNTPOINT --allow-other
 ```
+
+## Sidecar synchronization
+
+`sync` is deliberately not a general two-way synchronization tool. Media files
+are authoritative on the remote and flow only remote to local. Sidecars are
+authoritative locally: local additions and changes are uploaded, while remote
+sidecars only fill a missing local file.
+
+```sh
+mediastub sync \
+  --state-dir /var/lib/mediastub-movies \
+  --include '*.mkv,*.mp4' \
+  --poll-interval 5m \
+  --settle-time 3s \
+  https://drive.example/dav/movies \
+  /srv/media/movies
+```
+
+Use `--once` for one complete remote scan, local scan and reconcile. The state
+directory is mandatory, must be absolute, and is locked so two processes cannot
+use it simultaneously. Its `Remote` and `LocalRoot` identity must continue to
+match subsequent invocations.
+
+For every included remote Matroska or MP4 object, sync probes the remote using a
+fixed 16 MiB / 128 request / 256 KiB window budget and atomically creates a
+read-only ordinary sparse file. An existing media path is replaced only when it
+is already recorded as a managed stub. State loss therefore fails closed rather
+than overwriting a possible real local media file.
+
+Recognized sidecars must share a directory and stem with a managed media file:
+
+- exact `<stem>.nfo`;
+- common Jellyfin image forms such as `<stem>.jpg`, `-poster`, `-cover`,
+  `-fanartN`, `-backdropN`, `-thumb`, `-logo`, `-art` and `-disc` using JPG,
+  JPEG, PNG or WebP;
+- SRT, ASS, SSA, VTT or SUB subtitles with zero, one or two qualifiers, such as
+  `movie.zh.forced.srt`.
+
+The longest matching media stem wins. An equal-length ambiguity is logged and
+skipped. Other images and subtitles are not treated as sidecars.
+
+First synchronization is always `prefer-local`: differing local content
+overwrites the remote. Uploads use a direct PUT to the final path, followed by
+a complete SHA-256 read-back with bounded retries. This intentionally does not
+depend on `If-Match`, `If-None-Match`, `MOVE Overwrite:F`, or a remote temporary
+file. A duplicate remote path is logged with all available fingerprints and is
+skipped without selecting an object.
+
+Deleting a local sidecar creates a persistent tombstone. It does not delete the
+remote object and the old remote copy is not downloaded again. Recreating the
+local path clears the tombstone and uploads it. Remote media and sidecar deletes
+are not propagated locally in v1. Every poll also performs a complete local
+scan, so missed filesystem notifications recover automatically.
 
 ## Probe policy
 
@@ -302,20 +391,22 @@ remain readable as their original bytes. `fail` instead makes an eligible file
 unopenable when its media probe fails. Files not selected by `--include` always
 pass through unchanged.
 
-The filesystem is unconditionally mounted read-only. It never uploads, creates,
-renames or deletes upstream objects.
+The FUSE filesystem is unconditionally mounted read-only. Only `sync` writes
+recognized sidecars, and it never uploads local media or issues remote DELETE,
+MOVE or COPY operations.
 
 ## Tests
 
 ```sh
-go test ./...
+CGO_ENABLED=0 go test ./...
 go test ./core -run 'TestMediaRangeSuite|TestMediaRangeSuiteFFprobeStubs' -v
 nix flake check
 ```
 
 The flake check builds the package and `checks.<system>.module-eval`, which
-uses `nixosConfigurations.check-<system>` to evaluate a sample managed mount
-and verify its rendered systemd unit. Module values can also be inspected
+uses `nixosConfigurations.check-<system>` to evaluate sample mount and sync
+units. `nixosConfigurations.sync-only-<system>` also verifies that sync alone
+does not enable FUSE. Module values can be inspected
 directly, for example:
 
 ```sh
@@ -341,9 +432,13 @@ archives should be reviewed as intentional fixture updates.
 
 - `core`: container detection and immutable sparse read plans; standard library
   only, and unaware of filesystems or HTTP.
-- `origin`: the read-only namespace and random-read contract, with `local` and
-  `webdav` implementations.
+- `origin`: the namespace and random-read contract, plus the optional sidecar
+  PUT extension, with `local` and `webdav` implementations.
+- `pathfilter`: include parsing and `path.Match` behavior shared by both modes.
 - `mountfs`: policy, plan caching and the read-only go-fuse projection.
+- `syncer`: transactional scans, sparse materialization, sidecar classification,
+  tombstones, state, file watching and serialized reconciliation.
+- `internal/sdnotify`: minimal systemd readiness notification.
 - `cmd/mediastub`: CLI wiring and lifecycle only.
 
 The project is distributed under the MIT license; see [COPYING](COPYING).

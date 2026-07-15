@@ -102,6 +102,52 @@ func TestParseMountRequiresTwoArguments(t *testing.T) {
 	}
 }
 
+func TestParseSync(t *testing.T) {
+	opts, remote, local, err := parseSync([]string{
+		"file:///srv/media", "/srv/stubs", "--state-dir", "/var/lib/mediastub-test",
+		"--include=*.mkv,Anime/*.mp4", "--poll-interval", "10m", "--settle-time=2s", "--once",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remote != "file:///srv/media" || local != "/srv/stubs" || opts.stateDir != "/var/lib/mediastub-test" || opts.pollInterval.String() != "10m0s" || opts.settleTime.String() != "2s" || !opts.once {
+		t.Fatalf("parsed sync = %+v remote=%q local=%q", opts, remote, local)
+	}
+}
+
+func TestParseSyncValidation(t *testing.T) {
+	for _, args := range [][]string{
+		{"file:///srv/media", "/srv/stubs"},
+		{"--state-dir=relative", "file:///srv/media", "/srv/stubs"},
+		{"--state-dir=/state", "--poll-interval=0s", "file:///srv/media", "/srv/stubs"},
+		{"--state-dir=/state", "--settle-time=0s", "file:///srv/media", "/srv/stubs"},
+		{"--state-dir=/state", "--log-level=trace", "file:///srv/media", "/srv/stubs"},
+		{"--state-dir=/state", "--include=[", "file:///srv/media", "/srv/stubs"},
+		{"--state-dir=/state", "file:///srv/media", "relative"},
+	} {
+		if _, _, _, err := parseSync(args, io.Discard); err == nil {
+			t.Fatalf("invalid sync arguments accepted: %q", args)
+		}
+	}
+}
+
+func TestParseSyncHelpAndRootHelp(t *testing.T) {
+	var output bytes.Buffer
+	if _, _, _, err := parseSync([]string{"--help"}, &output); !errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("help error = %v", err)
+	}
+	for _, want := range []string{"mediastub sync", "state-dir", "poll-interval", "settle-time", "once", webDAVTokenEnv} {
+		if !bytes.Contains(output.Bytes(), []byte(want)) {
+			t.Errorf("sync help missing %q", want)
+		}
+	}
+	output.Reset()
+	rootUsage(&output)
+	if !bytes.Contains(output.Bytes(), []byte("mediastub mount")) || !bytes.Contains(output.Bytes(), []byte("mediastub sync")) {
+		t.Fatalf("root help = %s", output.String())
+	}
+}
+
 func TestParseMountRejectsInvalidLimits(t *testing.T) {
 	for _, args := range [][]string{
 		{"--probe-max-requests", "0", "file:///srv/media", "/data/media"},
@@ -139,15 +185,15 @@ func TestWebDAVCredentials(t *testing.T) {
 		"https://example.test/media/",
 		"http+unix://%2Frun%2Fwebdav.sock/media/",
 	} {
-		user, password, err := webDAVCredentials(remote)
-		if err != nil || user != "alice" || password != "secret" {
-			t.Fatalf("webDAVCredentials(%q) = %q, %q, %v", remote, user, password, err)
+		auth, err := webDAVCredentials(remote)
+		if err != nil || auth.User != "alice" || auth.Password != "secret" || auth.BearerToken != "" {
+			t.Fatalf("webDAVCredentials(%q) = %+v, %v", remote, auth, err)
 		}
 	}
 
-	user, password, err := webDAVCredentials("file:///srv/media")
-	if err != nil || user != "" || password != "" {
-		t.Fatalf("file credentials = %q, %q, %v; want empty", user, password, err)
+	auth, err := webDAVCredentials("file:///srv/media")
+	if err != nil || auth.User != "" || auth.Password != "" || auth.BearerToken != "" {
+		t.Fatalf("file credentials = %+v, %v; want empty", auth, err)
 	}
 }
 
@@ -165,8 +211,28 @@ func TestWebDAVCredentialsMustBePaired(t *testing.T) {
 	})
 	t.Setenv(webDAVUserEnv, "alice")
 	for _, remote := range []string{"http://example.test/media/", "https://example.test/media/"} {
-		if _, _, err := webDAVCredentials(remote); err == nil {
+		if _, err := webDAVCredentials(remote); err == nil {
 			t.Fatalf("unpaired WebDAV credential was accepted for %q", remote)
 		}
+	}
+}
+
+func TestWebDAVBearerCredentials(t *testing.T) {
+	t.Setenv(webDAVTokenEnv, "token")
+	auth, err := webDAVCredentials("https://example.test/media")
+	if err != nil || auth.BearerToken != "token" || auth.User != "" {
+		t.Fatalf("Bearer credentials = %+v, %v", auth, err)
+	}
+	t.Setenv(webDAVUserEnv, "alice")
+	t.Setenv(webDAVPasswordEnv, "secret")
+	if _, err := webDAVCredentials("https://example.test/media"); err == nil {
+		t.Fatal("Basic and Bearer credentials were accepted together")
+	}
+}
+
+func TestWebDAVCredentialsRejectEmptyValues(t *testing.T) {
+	t.Setenv(webDAVTokenEnv, "")
+	if _, err := webDAVCredentials("https://example.test/media"); err == nil {
+		t.Fatal("empty token was accepted")
 	}
 }

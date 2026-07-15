@@ -7,13 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"path"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/qbisi/mediastub/core"
 	"github.com/qbisi/mediastub/origin"
+	"github.com/qbisi/mediastub/pathfilter"
 )
 
 // Config controls media probing and Plan caching.
@@ -40,8 +39,9 @@ type probeCall struct {
 
 // Service selects media objects, creates Plans and opens projected views.
 type Service struct {
-	origin origin.Origin
-	config Config
+	origin  origin.Origin
+	config  Config
+	matcher *pathfilter.Matcher
 
 	mu    sync.Mutex
 	cache map[string]*probeCall
@@ -58,10 +58,9 @@ func NewService(upstream origin.Origin, config Config) (*Service, error) {
 	if config.OnError != "passthrough" && config.OnError != "fail" {
 		return nil, fmt.Errorf("on-error must be passthrough or fail")
 	}
-	for _, pattern := range config.Includes {
-		if _, err := path.Match(pattern, ""); err != nil {
-			return nil, fmt.Errorf("invalid include pattern %q: %w", pattern, err)
-		}
+	matcher, err := pathfilter.New(config.Includes)
+	if err != nil {
+		return nil, err
 	}
 	if config.CacheEntries <= 0 {
 		config.CacheEntries = 1024
@@ -69,25 +68,13 @@ func NewService(upstream origin.Origin, config Config) (*Service, error) {
 	if config.Logger == nil {
 		config.Logger = log.Default()
 	}
-	return &Service{origin: upstream, config: config, cache: make(map[string]*probeCall)}, nil
+	return &Service{origin: upstream, config: config, matcher: matcher, cache: make(map[string]*probeCall)}, nil
 }
 
 // Origin returns the read-only namespace backing this service.
 func (s *Service) Origin() origin.Origin { return s.origin }
 
-func (s *Service) matches(name string) bool {
-	for _, pattern := range s.config.Includes {
-		target := path.Base(name)
-		if strings.Contains(pattern, "/") {
-			target = name
-		}
-		matched, err := path.Match(pattern, target)
-		if err == nil && matched {
-			return true
-		}
-	}
-	return false
-}
+func (s *Service) matches(name string) bool { return s.matcher.Match(name) }
 
 // StubCandidate reports whether an entry is eligible for media probing before
 // caller-process policy is applied.

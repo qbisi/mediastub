@@ -1,6 +1,7 @@
 package origin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -48,6 +49,33 @@ func TestLocalNamespaceAndRead(t *testing.T) {
 	n, err := object.ReadAt(context.Background(), buf, 3)
 	if err != nil || n != len(buf) || string(buf) != "3456" {
 		t.Fatalf("ReadAt = %q, %d, %v", buf, n, err)
+	}
+}
+
+func TestLocalPut(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "sidecars"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	local, err := NewLocal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = local.Close() })
+	want := []byte("new sidecar")
+	entry, err := local.Put(context.Background(), "sidecars/movie.nfo", bytes.NewReader(want), int64(len(want)), "application/xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.Size != int64(len(want)) {
+		t.Fatalf("entry = %+v", entry)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "sidecars", "movie.nfo"))
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("content = %q, %v", got, err)
+	}
+	if _, err := local.Put(context.Background(), "missing/movie.nfo", bytes.NewReader(want), int64(len(want)), ""); err == nil {
+		t.Fatal("PUT with missing parent succeeded")
 	}
 }
 

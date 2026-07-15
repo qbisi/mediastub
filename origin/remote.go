@@ -18,8 +18,16 @@ const remoteHTTPTimeout = 2 * time.Minute
 // WebDAV URL. WebDAV credentials are supplied separately so they never need to
 // appear in the URL or process arguments.
 func NewRemote(remote, user, password string) (Origin, error) {
+	return NewRemoteWithAuth(remote, Auth{User: user, Password: password})
+}
+
+// NewRemoteWithAuth constructs an Origin using explicit WebDAV authentication.
+func NewRemoteWithAuth(remote string, auth Auth) (Origin, error) {
+	if err := auth.Validate(); err != nil {
+		return nil, err
+	}
 	if strings.HasPrefix(remote, "http+unix://") {
-		return newUnixWebDAV(remote, user, password)
+		return newUnixWebDAVWithAuth(remote, auth)
 	}
 	u, err := url.Parse(remote)
 	if err != nil {
@@ -44,7 +52,7 @@ func NewRemote(remote, user, password string) (Origin, error) {
 		if u.Host == "" {
 			return nil, errors.New("HTTP(S) WebDAV remote requires a host")
 		}
-		return newOwnedWebDAV(u.String(), user, password, defaultHTTPTransport())
+		return newOwnedWebDAVWithAuth(u.String(), auth, defaultHTTPTransport())
 	default:
 		return nil, fmt.Errorf("unsupported remote scheme %q; want file, http, https or http+unix", u.Scheme)
 	}
@@ -55,10 +63,18 @@ func defaultHTTPTransport() *http.Transport {
 }
 
 func newUnixWebDAV(remote, user, password string) (Origin, error) {
-	return newUnixWebDAVWithNetworkTransport(remote, user, password, defaultHTTPTransport())
+	return newUnixWebDAVWithAuth(remote, Auth{User: user, Password: password})
+}
+
+func newUnixWebDAVWithAuth(remote string, auth Auth) (Origin, error) {
+	return newUnixWebDAVWithNetworkTransportAuth(remote, auth, defaultHTTPTransport())
 }
 
 func newUnixWebDAVWithNetworkTransport(remote, user, password string, networkTransport *http.Transport) (Origin, error) {
+	return newUnixWebDAVWithNetworkTransportAuth(remote, Auth{User: user, Password: password}, networkTransport)
+}
+
+func newUnixWebDAVWithNetworkTransportAuth(remote string, auth Auth, networkTransport *http.Transport) (Origin, error) {
 	remainder := strings.TrimPrefix(remote, "http+unix://")
 	separator := strings.IndexAny(remainder, "/?#")
 	if separator < 0 {
@@ -98,7 +114,7 @@ func newUnixWebDAVWithNetworkTransport(remote, user, password string, networkTra
 	transport := &redirectTransport{
 		unixHost: base.Host, unix: unixTransport, network: networkTransport,
 	}
-	return newOwnedWebDAV(base.String(), user, password, transport)
+	return newOwnedWebDAVWithAuth(base.String(), auth, transport)
 }
 
 // redirectTransport sends requests for the synthetic WebDAV host over the
@@ -129,8 +145,12 @@ type ownedTransport interface {
 }
 
 func newOwnedWebDAV(baseURL, user, password string, transport ownedTransport) (Origin, error) {
+	return newOwnedWebDAVWithAuth(baseURL, Auth{User: user, Password: password}, transport)
+}
+
+func newOwnedWebDAVWithAuth(baseURL string, auth Auth, transport ownedTransport) (Origin, error) {
 	client := &http.Client{Transport: transport, Timeout: remoteHTTPTimeout}
-	webdav, err := NewWebDAV(baseURL, user, password, client)
+	webdav, err := NewWebDAVWithAuth(baseURL, auth, client)
 	if err != nil {
 		transport.CloseIdleConnections()
 		return nil, err

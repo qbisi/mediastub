@@ -47,6 +47,13 @@ type Origin interface {
 	Close() error
 }
 
+// MutableOrigin is the optional write boundary used by sidecar synchronization.
+// Implementations publish directly to the requested path and return its metadata.
+type MutableOrigin interface {
+	Origin
+	Put(ctx context.Context, path string, src io.Reader, size int64, contentType string) (Entry, error)
+}
+
 // ReadFullAt normalizes short ranged reads to io.ReaderAt semantics.
 func ReadFullAt(ctx context.Context, object Object, p []byte, off int64) (int, error) {
 	read := 0

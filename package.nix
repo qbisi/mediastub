@@ -12,8 +12,11 @@ buildGoModule {
     fileset = lib.fileset.unions [
       ./cmd
       ./core
+      ./internal
       ./mountfs
       ./origin
+      ./pathfilter
+      ./syncer
       ./testdata
       ./go.mod
       ./go.sum
@@ -22,7 +25,7 @@ buildGoModule {
     ];
   };
 
-  vendorHash = "sha256-R91IodL/yzGPVeSY5SCYJOcPy83tnui+j0ErFwAW4lg=";
+  vendorHash = "sha256-RsN9EkoYa5N7SPmgv52oMG4C7CWYASVyE9uJxPdBkFE=";
   subPackages = [ "cmd/mediastub" ];
   env.CGO_ENABLED = 0;
 
@@ -33,7 +36,7 @@ buildGoModule {
   '';
 
   meta = {
-    description = "Read-only FUSE filesystem providing metadata-only media views";
+    description = "Metadata-only media views and sidecar synchronization";
     homepage = "https://github.com/qbisi/mediastub";
     license = lib.licenses.mit;
     mainProgram = "mediastub";

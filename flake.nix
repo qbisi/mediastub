@@ -12,7 +12,7 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs supportedSystems;
       mkCheckConfiguration =
-        system:
+        system: withMount:
         nixpkgs.lib.nixosSystem {
           inherit system;
           modules = [
@@ -26,14 +26,26 @@
               boot.loader.grub.devices = [ "nodev" ];
               services.mediastub = {
                 enable = true;
-                mounts.check = {
-                  remote = "http+unix://%2Frun%2Fopenlist%2Fsocket/dav/media";
-                  mountPoint = "/run/mediastub-check";
+                mounts = nixpkgs.lib.optionalAttrs withMount {
+                  check = {
+                    remote = "http+unix://%2Frun%2Fopenlist%2Fsocket/dav/media";
+                    mountPoint = "/run/mediastub-check";
+                    consumers = [ "media-server.service" ];
+                    include = [ "*.mkv" ];
+                    options = [ "--allow-other" ];
+                  };
+                };
+                syncs.check = {
+                  remote = "https://example.invalid/dav/media";
+                  localDirectory = "/srv/media";
+                  environmentFile = "/run/secrets/mediastub";
                   consumers = [ "media-server.service" ];
-                  options = [
-                    "--allow-other"
-                    "--include=*.mkv"
+                  include = [
+                    "*.mkv"
+                    "*.mp4"
                   ];
+                  pollInterval = 300;
+                  settleTime = 3;
                 };
               };
             }
@@ -63,27 +75,47 @@
         system:
         let
           evaluated = self.nixosConfigurations."check-${system}";
+          syncOnly = self.nixosConfigurations."sync-only-${system}";
           pkgs = evaluated.pkgs;
           unit = evaluated.config.systemd.units."mediastub-check.service".unit;
+          syncUnit = evaluated.config.systemd.units."mediastub-sync-check.service".unit;
         in
         {
-          module-eval = pkgs.runCommand "mediastub-module-eval" { } ''
-            unit=${unit}/mediastub-check.service
-            test -f "$unit"
-            ${pkgs.gnugrep}/bin/grep -Fq "User=mediastub" "$unit"
-            ${pkgs.gnugrep}/bin/grep -Fq -- "--allow-other" "$unit"
-            ${pkgs.gnugrep}/bin/grep -Fq "http+unix://%%2Frun%%2Fopenlist%%2Fsocket/dav/media" "$unit"
-            ${pkgs.gnugrep}/bin/grep -Fq "Before=media-server.service" "$unit"
-            touch "$out"
-          '';
+          module-eval =
+            assert !syncOnly.config.programs.fuse.enable;
+            pkgs.runCommand "mediastub-module-eval" { } ''
+              unit=${unit}/mediastub-check.service
+              sync_unit=${syncUnit}/mediastub-sync-check.service
+              test -f "$unit"
+              test -f "$sync_unit"
+              ${pkgs.gnugrep}/bin/grep -Fq "User=mediastub" "$unit"
+              ${pkgs.gnugrep}/bin/grep -Fq -- "--allow-other" "$unit"
+              ${pkgs.gnugrep}/bin/grep -Fq -- "--include=*.mkv" "$unit"
+              ${pkgs.gnugrep}/bin/grep -Fq "http+unix://%%2Frun%%2Fopenlist%%2Fsocket/dav/media" "$unit"
+              ${pkgs.gnugrep}/bin/grep -Fq "Before=media-server.service" "$unit"
+              ${pkgs.gnugrep}/bin/grep -Fq "Type=notify" "$sync_unit"
+              ${pkgs.gnugrep}/bin/grep -Fq "StateDirectory=mediastub-sync-check" "$sync_unit"
+              ${pkgs.gnugrep}/bin/grep -Fq "UMask=0002" "$sync_unit"
+              ${pkgs.gnugrep}/bin/grep -Fq -- "--include=*.mkv,*.mp4" "$sync_unit"
+              ${pkgs.gnugrep}/bin/grep -Fq -- "--poll-interval=300s" "$sync_unit"
+              ${pkgs.gnugrep}/bin/grep -Fq -- "--settle-time=3s" "$sync_unit"
+              ${pkgs.gnugrep}/bin/grep -Fq "Before=media-server.service" "$sync_unit"
+              touch "$out"
+            '';
         }
       );
 
       nixosConfigurations = builtins.listToAttrs (
-        map (system: {
-          name = "check-${system}";
-          value = mkCheckConfiguration system;
-        }) supportedSystems
+        builtins.concatMap (system: [
+          {
+            name = "check-${system}";
+            value = mkCheckConfiguration system true;
+          }
+          {
+            name = "sync-only-${system}";
+            value = mkCheckConfiguration system false;
+          }
+        ]) supportedSystems
       );
 
       nixosModules = rec {

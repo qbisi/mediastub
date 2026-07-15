@@ -4,15 +4,21 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	iofs "io/fs"
 	"os"
 	"path"
+	"strings"
 	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // Local exposes a directory through os.Root so paths cannot escape it.
 type Local struct {
-	root *os.Root
+	root    *os.Root
+	rootDir *os.File
 }
 
 // NewLocal opens root as a read-only origin.
@@ -21,7 +27,12 @@ func NewLocal(root string) (*Local, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Local{root: r}, nil
+	dir, err := os.Open(root)
+	if err != nil {
+		_ = r.Close()
+		return nil, err
+	}
+	return &Local{root: r, rootDir: dir}, nil
 }
 
 func localError(err error) error {
@@ -119,8 +130,61 @@ func (l *Local) Open(ctx context.Context, entry Entry) (Object, error) {
 	return &localObject{file: f}, nil
 }
 
+// Put atomically publishes a local object. Its parent directory must exist.
+func (l *Local) Put(ctx context.Context, rel string, src io.Reader, size int64, _ string) (Entry, error) {
+	if err := ctx.Err(); err != nil {
+		return Entry{}, err
+	}
+	clean, err := CleanPath(rel)
+	if err != nil {
+		return Entry{}, err
+	}
+	if clean == "." || size < 0 {
+		return Entry{}, errors.New("invalid local PUT target or size")
+	}
+	parent := path.Dir(clean)
+	if info, err := l.root.Stat(parent); err != nil || !info.IsDir() {
+		if err == nil {
+			err = ErrNotDir
+		}
+		return Entry{}, fmt.Errorf("local PUT parent %q: %w", parent, localError(err))
+	}
+	tmp := path.Join(parent, "."+path.Base(clean)+".mediastub-tmp-"+strings.ReplaceAll(fmt.Sprintf("%d", time.Now().UnixNano()), "-", ""))
+	f, err := l.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return Entry{}, localError(err)
+	}
+	cleanup := func() { _ = l.root.Remove(tmp) }
+	written, copyErr := io.Copy(f, io.LimitReader(src, size+1))
+	if copyErr == nil && written != size {
+		copyErr = fmt.Errorf("local PUT copied %d bytes, want %d", written, size)
+	}
+	if copyErr == nil {
+		copyErr = f.Sync()
+	}
+	closeErr := f.Close()
+	if copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		cleanup()
+		return Entry{}, copyErr
+	}
+	// os.Root.Rename was added after the project's Go 1.24 baseline. renameat
+	// preserves atomic same-origin publication even if the root itself is moved.
+	if err := unix.Renameat(int(l.rootDir.Fd()), tmp, int(l.rootDir.Fd()), clean); err != nil {
+		cleanup()
+		return Entry{}, localError(err)
+	}
+	if dir, err := l.root.Open(parent); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return l.Stat(ctx, clean)
+}
+
 // Close closes the protected root.
-func (l *Local) Close() error { return l.root.Close() }
+func (l *Local) Close() error { return errors.Join(l.root.Close(), l.rootDir.Close()) }
 
 type localObject struct {
 	file *os.File
@@ -134,3 +198,5 @@ func (o *localObject) ReadAt(ctx context.Context, p []byte, off int64) (int, err
 }
 
 func (o *localObject) Close() error { return o.file.Close() }
+
+var _ MutableOrigin = (*Local)(nil)
