@@ -115,7 +115,7 @@ let
       settleTime = lib.mkOption {
         type = lib.types.ints.positive;
         default = 3;
-        description = "Seconds a local sidecar must remain unchanged before upload.";
+        description = "Seconds a local media or sidecar file must remain unchanged before upload.";
       };
       logLevel = lib.mkOption {
         type = lib.types.enum [
@@ -226,7 +226,7 @@ let
   mkSyncService =
     name: sync:
     lib.nameValuePair (syncServiceName name) {
-      description = "mediastub sidecar synchronization ${name}";
+      description = "mediastub media and sidecar synchronization ${name}";
       wantedBy = [ "multi-user.target" ];
       requiredBy = map consumerUnit sync.consumers;
       before = map consumerUnit sync.consumers;

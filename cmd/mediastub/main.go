@@ -172,7 +172,7 @@ func parseSync(args []string, output io.Writer) (syncOptions, string, string, er
 	flags.SetOutput(output)
 	flags.StringVar(&opts.include, "include", defaultIncludes, "comma-separated path.Match patterns identifying media files")
 	flags.DurationVar(&opts.pollInterval, "poll-interval", 5*time.Minute, "interval between complete remote scans")
-	flags.DurationVar(&opts.settleTime, "settle-time", 3*time.Second, "time a local sidecar must remain unchanged")
+	flags.DurationVar(&opts.settleTime, "settle-time", 3*time.Second, "time a local media or sidecar file must remain unchanged")
 	flags.StringVar(&opts.stateDir, "state-dir", "", "absolute directory for state.json and the process lock (required)")
 	flags.StringVar(&opts.logLevel, "log-level", "info", "logging detail: info, verbose or debug")
 	flags.BoolVar(&opts.daemon, "daemon", false, "continue applying the initial plan, then watch local changes and poll the remote")

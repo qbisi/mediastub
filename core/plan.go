@@ -1,6 +1,8 @@
 package core
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -57,6 +59,24 @@ func (p *Plan) Extents() []Extent {
 		extents[i] = Extent{Offset: extent.Offset, Data: append([]byte(nil), extent.Data...)}
 	}
 	return extents
+}
+
+// Hash returns a stable digest of the logical size and ordered extent data.
+func (p *Plan) Hash() [32]byte {
+	h := sha256.New()
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], uint64(p.logicalSize))
+	_, _ = h.Write(encoded[:])
+	for _, extent := range p.extents {
+		binary.BigEndian.PutUint64(encoded[:], uint64(extent.Offset))
+		_, _ = h.Write(encoded[:])
+		binary.BigEndian.PutUint64(encoded[:], uint64(len(extent.Data)))
+		_, _ = h.Write(encoded[:])
+		_, _ = h.Write(extent.Data)
+	}
+	var sum [32]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
 }
 
 // ReadAt reads metadata extents and fills every other byte with zero.

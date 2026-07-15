@@ -1,4 +1,4 @@
-// Package syncer maintains local sparse media stubs and synchronizes sidecars.
+// Package syncer maintains local sparse media stubs and synchronizes media and sidecars.
 package syncer
 
 import (
@@ -63,7 +63,7 @@ func New(upstream origin.Origin, config Config) (*Service, error) {
 		return nil, errors.New("origin is required")
 	}
 	if _, ok := upstream.(origin.MutableOrigin); !ok {
-		return nil, errors.New("origin does not support sidecar PUT")
+		return nil, errors.New("origin does not support media and sidecar PUT")
 	}
 	if err := config.normalize(); err != nil {
 		return nil, err

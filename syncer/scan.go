@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"syscall"
 
 	"github.com/qbisi/mediastub/origin"
 )
@@ -62,7 +63,24 @@ type localFile struct {
 	Path    string
 	Size    int64
 	ModTime int64
+	Inode   uint64
 	Mode    fs.FileMode
+}
+
+func localFileInfo(rel string, info fs.FileInfo) localFile {
+	var inode uint64
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+		inode = stat.Ino
+	}
+	return localFile{Path: rel, Size: info.Size(), ModTime: info.ModTime().UnixNano(), Inode: inode, Mode: info.Mode()}
+}
+
+func statLocal(root, rel string) (localFile, error) {
+	info, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel)))
+	if err != nil {
+		return localFile{}, err
+	}
+	return localFileInfo(rel, info), nil
 }
 
 func scanLocal(root string) (map[string]localFile, error) {
@@ -95,7 +113,7 @@ func scanLocal(root string) (map[string]localFile, error) {
 			return err
 		}
 		rel = path.Clean(filepath.ToSlash(rel))
-		files[rel] = localFile{Path: rel, Size: info.Size(), ModTime: info.ModTime().UnixNano(), Mode: info.Mode()}
+		files[rel] = localFileInfo(rel, info)
 		return nil
 	})
 	return files, err

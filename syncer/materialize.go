@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/qbisi/mediastub/core"
+	"github.com/qbisi/mediastub/marker"
 	"github.com/qbisi/mediastub/origin"
 )
 
@@ -25,7 +26,7 @@ func (s *originSource) ReadAt(p []byte, off int64) (int, error) {
 	return origin.ReadFullAt(s.ctx, s.object, p, off)
 }
 
-func probeEntry(ctx context.Context, upstream origin.Origin, entry origin.Entry, budget core.Budget) (*core.Plan, error) {
+func probeEntry(ctx context.Context, upstream origin.Origin, entry origin.Entry, budget core.Budget) (*core.Result, error) {
 	object, err := upstream.Open(ctx, entry)
 	if err != nil {
 		return nil, err
@@ -38,7 +39,7 @@ func probeEntry(ctx context.Context, upstream origin.Origin, entry origin.Entry,
 	if probeErr != nil {
 		return nil, probeErr
 	}
-	return result.Plan, nil
+	return result, nil
 }
 
 func randomSuffix() string {
@@ -49,7 +50,7 @@ func randomSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
-func materializePlan(ctx context.Context, root, rel string, plan *core.Plan, mtime time.Time) error {
+func materializePlan(ctx context.Context, root, rel string, result *core.Result, remoteETag string, mtime time.Time) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -58,14 +59,20 @@ func materializePlan(ctx context.Context, root, rel string, plan *core.Plan, mti
 	if err := os.MkdirAll(parent, 0o775); err != nil {
 		return err
 	}
-	tmp := filepath.Join(parent, "."+filepath.Base(target)+".mediastub-tmp-"+randomSuffix())
+	tmp := filepath.Join(parent, fmt.Sprintf(".%s.mediastub-new-%d-%s", filepath.Base(target), os.Getpid(), randomSuffix()))
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
 	if err != nil {
 		return err
 	}
 	cleanup := func() { _ = os.Remove(tmp) }
-	if err = f.Truncate(plan.Size()); err == nil {
-		for _, extent := range plan.Extents() {
+	trailer, err := marker.Trailer(result.Format, result.Plan.Size(), remoteETag, result.Plan.Hash())
+	if err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err = f.Truncate(result.Plan.Size()); err == nil {
+		for _, extent := range result.Plan.Extents() {
 			if err = ctx.Err(); err != nil {
 				break
 			}
@@ -77,6 +84,13 @@ func materializePlan(ctx context.Context, root, rel string, plan *core.Plan, mti
 			if err != nil {
 				break
 			}
+		}
+	}
+	if err == nil {
+		var n int
+		n, err = f.WriteAt(trailer, result.Plan.Size())
+		if err == nil && n != len(trailer) {
+			err = io.ErrShortWrite
 		}
 	}
 	if err == nil {

@@ -17,7 +17,7 @@ import (
 const propfindBody = `<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/><d:getetag/><d:getcontenttype/></d:prop></d:propfind>`
 
-// WebDAV exposes a read-only WebDAV collection as an Origin.
+// WebDAV exposes a WebDAV collection as a mutable Origin.
 type WebDAV struct {
 	base   *url.URL
 	client *http.Client

@@ -13,6 +13,7 @@ buildGoModule {
       ./cmd
       ./core
       ./internal
+      ./marker
       ./mountfs
       ./origin
       ./pathfilter

@@ -47,7 +47,7 @@ type Origin interface {
 	Close() error
 }
 
-// MutableOrigin is the optional write boundary used by sidecar synchronization.
+// MutableOrigin is the optional write boundary used by media and sidecar synchronization.
 // Implementations publish directly to the requested path and return its metadata.
 type MutableOrigin interface {
 	Origin

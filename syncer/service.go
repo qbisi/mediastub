@@ -137,50 +137,22 @@ func (s *Service) scanInputs(ctx context.Context, refreshRemote bool) (map[strin
 }
 
 func (s *Service) applyReconcile(ctx context.Context, local map[string]localFile, remoteScan bool) error {
-	if err := s.reconcileMedia(ctx, local, remoteScan); err != nil {
-		return errors.Join(err, s.store.Save(s.state))
-	}
+	mediaErr := s.reconcileMediaFiles(ctx, local, remoteScan)
 	// Persist ownership of newly published stubs before sidecar I/O. Otherwise
 	// a later failure could make a valid stub look like an untracked collision.
 	if err := s.store.Save(s.state); err != nil {
-		return err
+		return errors.Join(mediaErr, err)
 	}
 	local, err := scanLocal(s.config.LocalRoot)
 	if err != nil {
-		return err
+		return errors.Join(mediaErr, err)
 	}
 	sidecarErr := s.reconcileSidecars(ctx, local)
-	return errors.Join(sidecarErr, s.store.Save(s.state))
+	return errors.Join(mediaErr, sidecarErr, s.store.Save(s.state))
 }
 
 func (s *Service) planWork(local map[string]localFile) (mediaCount, sidecarCount int) {
-	managed := make(map[string]bool)
-	for rel, media := range s.state.Media {
-		if media.Managed {
-			managed[rel] = true
-		}
-	}
-	for rel, entry := range s.snapshot.Entries {
-		if entry.IsDir || entry.Size <= 0 || !s.matcher.Match(rel) || s.duplicateBlocked(rel) {
-			continue
-		}
-		previous, tracked := s.state.Media[rel]
-		lf, exists := local[rel]
-		if (tracked && !previous.Managed && exists) || (!tracked && exists) {
-			continue
-		}
-		managed[rel] = true
-		valid := tracked && previous.Managed && exists && lf.Size == entry.Size && lf.Mode.Perm() == 0o444 && previous.Fingerprint == entry.Fingerprint() && time.Unix(0, lf.ModTime).Equal(previous.LocalMTime)
-		if !valid {
-			mediaCount++
-			s.logf("debug", "planned media path=%q", rel)
-		}
-	}
-	mediaPaths := make([]string, 0, len(managed))
-	for rel := range managed {
-		mediaPaths = append(mediaPaths, rel)
-	}
-	sort.Strings(mediaPaths)
+	mediaPaths, mediaCount := s.planMediaWork(local)
 	remoteSidecars := make(map[string]origin.Entry)
 	localSidecars := make(map[string]localFile)
 	candidates := make(map[string]bool)
@@ -207,9 +179,6 @@ func (s *Service) planWork(local map[string]localFile) (mediaCount, sidecarCount
 	for rel := range s.state.Sidecars {
 		candidates[rel] = true
 	}
-	for rel := range s.state.Tombstones {
-		candidates[rel] = true
-	}
 	for rel := range candidates {
 		if s.duplicateBlocked(rel) {
 			continue
@@ -217,20 +186,13 @@ func (s *Service) planWork(local map[string]localFile) (mediaCount, sidecarCount
 		lf, localExists := localSidecars[rel]
 		remoteEntry, remoteExists := remoteSidecars[rel]
 		previous, known := s.state.Sidecars[rel]
-		_, tombstoned := s.state.Tombstones[rel]
 		needsWork := false
 		switch {
 		case localExists:
-			localChanged := !known || previous.LocalSize != lf.Size || !previous.LocalMTime.Equal(time.Unix(0, lf.ModTime)) || previous.Status == "local-dirty"
+			localChanged := !known || previous.LocalSize != lf.Size || !previous.LocalMTime.Equal(time.Unix(0, lf.ModTime)) || previous.Status == "local-dirty" || previous.Status == "upload-failed"
 			remoteChanged := !remoteExists || !known || previous.RemoteETag != remoteEntry.ETag || previous.RemoteSize != remoteEntry.Size || !previous.RemoteMTime.Equal(remoteEntry.ModTime)
-			needsWork = tombstoned || localChanged || remoteChanged || (remoteExists && remoteEntry.ETag == "")
-		case known && previous.LocalSHA256 != "" && !tombstoned:
-			needsWork = true
-		case tombstoned:
-			needsWork = false
-		case remoteExists && !known:
-			needsWork = true
-		case known && !remoteExists:
+			needsWork = localChanged || remoteChanged || (remoteExists && remoteEntry.ETag == "")
+		case remoteExists || known:
 			needsWork = true
 		}
 		if needsWork {
@@ -239,71 +201,6 @@ func (s *Service) planWork(local map[string]localFile) (mediaCount, sidecarCount
 		}
 	}
 	return mediaCount, sidecarCount
-}
-
-func (s *Service) reconcileMedia(ctx context.Context, local map[string]localFile, remoteScan bool) error {
-	now := time.Now().UTC()
-	seen := make(map[string]bool)
-	paths := make([]string, 0)
-	for rel, entry := range s.snapshot.Entries {
-		if !entry.IsDir && entry.Size > 0 && s.matcher.Match(rel) {
-			paths = append(paths, rel)
-		}
-	}
-	sort.Strings(paths)
-	for _, rel := range paths {
-		entry := s.snapshot.Entries[rel]
-		seen[rel] = true
-		previous, tracked := s.state.Media[rel]
-		lf, exists := local[rel]
-		if tracked && !previous.Managed {
-			if exists {
-				if remoteScan {
-					previous.LastSeen = now
-				}
-				previous.Status = "local-media-collision"
-				s.state.Media[rel] = previous
-				continue
-			}
-			delete(s.state.Media, rel)
-			tracked = false
-		}
-		if !tracked && exists {
-			s.logf("info", "local-media-collision path=%q", rel)
-			s.state.Media[rel] = MediaState{Fingerprint: entry.Fingerprint(), ETag: entry.ETag, Size: entry.Size, RemoteMTime: entry.ModTime, LocalMTime: time.Unix(0, lf.ModTime), LastSeen: now, Status: "local-media-collision", Managed: false}
-			continue
-		}
-		valid := tracked && exists && lf.Size == entry.Size && lf.Mode.Perm() == 0o444 && previous.Fingerprint == entry.Fingerprint() && time.Unix(0, lf.ModTime).Equal(previous.LocalMTime)
-		if !valid {
-			started := time.Now()
-			plan, err := probeEntry(ctx, s.origin, entry, s.config.Budget)
-			if err != nil {
-				s.logf("info", "stub probe failed path=%q error=%v", rel, err)
-				continue
-			}
-			if err := materializePlan(ctx, s.config.LocalRoot, rel, plan, entry.ModTime); err != nil {
-				return fmt.Errorf("materialize %q: %w", rel, err)
-			}
-			info, err := os.Stat(filepath.Join(s.config.LocalRoot, filepath.FromSlash(rel)))
-			if err != nil {
-				return err
-			}
-			lf = localFile{Path: rel, Size: info.Size(), ModTime: info.ModTime().UnixNano(), Mode: info.Mode()}
-			s.logf("info", "stub synchronized path=%q size=%d time=%s", rel, entry.Size, time.Since(started).Round(time.Millisecond))
-		}
-		lastSeen := previous.LastSeen
-		if remoteScan {
-			lastSeen = now
-		}
-		s.state.Media[rel] = MediaState{Fingerprint: entry.Fingerprint(), ETag: entry.ETag, Size: entry.Size, RemoteMTime: entry.ModTime, LocalMTime: time.Unix(0, lf.ModTime), LastSeen: lastSeen, Status: "active", Managed: true}
-	}
-	for rel, media := range s.state.Media {
-		if remoteScan && !seen[rel] && media.Managed && !s.duplicateBlocked(rel) {
-			media.Status = "remote-missing"
-			s.state.Media[rel] = media
-		}
-	}
-	return nil
 }
 
 func (s *Service) duplicateBlocked(rel string) bool {
@@ -339,6 +236,7 @@ func (s *Service) reconcileSidecars(ctx context.Context, local map[string]localF
 	mediaPaths := s.trackedMediaPaths()
 	remoteSidecars := make(map[string]origin.Entry)
 	localSidecars := make(map[string]localFile)
+	mediaFor := make(map[string]string)
 	for rel, entry := range s.snapshot.Entries {
 		if entry.IsDir || s.matcher.Match(rel) {
 			continue
@@ -350,6 +248,7 @@ func (s *Service) reconcileSidecars(ctx context.Context, local map[string]localF
 		}
 		if match.MediaPath != "" {
 			remoteSidecars[rel] = entry
+			mediaFor[rel] = match.MediaPath
 		}
 	}
 	for rel, file := range local {
@@ -363,6 +262,7 @@ func (s *Service) reconcileSidecars(ctx context.Context, local map[string]localF
 		}
 		if match.MediaPath != "" {
 			localSidecars[rel] = file
+			mediaFor[rel] = match.MediaPath
 		}
 	}
 	all := make(map[string]bool)
@@ -373,9 +273,6 @@ func (s *Service) reconcileSidecars(ctx context.Context, local map[string]localF
 		all[rel] = true
 	}
 	for rel := range s.state.Sidecars {
-		all[rel] = true
-	}
-	for rel := range s.state.Tombstones {
 		all[rel] = true
 	}
 	paths := make([]string, 0, len(all))
@@ -390,18 +287,14 @@ func (s *Service) reconcileSidecars(ctx context.Context, local map[string]localF
 		lf, localExists := localSidecars[rel]
 		remoteEntry, remoteExists := remoteSidecars[rel]
 		previous, known := s.state.Sidecars[rel]
-		_, tombstoned := s.state.Tombstones[rel]
 		if localExists {
-			if tombstoned {
-				delete(s.state.Tombstones, rel)
-			}
 			localHash, stableFile, err := s.stableLocalHash(ctx, rel, lf)
 			if err != nil {
 				s.logf("info", "sidecar remains dirty path=%q error=%v", rel, err)
 				actionErrors = append(actionErrors, fmt.Errorf("settle sidecar %q: %w", rel, err))
 				continue
 			}
-			needUpload := !remoteExists || tombstoned
+			needUpload := !remoteExists
 			if !known && remoteExists {
 				remoteHash, err := hashRemote(ctx, s.origin, remoteEntry)
 				if err != nil {
@@ -418,12 +311,12 @@ func (s *Service) reconcileSidecars(ctx context.Context, local map[string]localF
 					}
 					remoteChanged = remoteHash != previous.LastUploadedSHA256
 				}
-				needUpload = needUpload || previous.LastUploadedSHA256 != localHash || remoteChanged || previous.Status == "local-dirty"
+				needUpload = needUpload || previous.LastUploadedSHA256 != localHash || remoteChanged || previous.Status == "local-dirty" || previous.Status == "upload-failed"
 			}
 			if needUpload {
 				entry, err := s.uploadAndVerify(ctx, rel, stableFile, localHash)
 				if err != nil {
-					s.state.Sidecars[rel] = SidecarState{LocalSHA256: localHash, LocalSize: stableFile.Size, LocalMTime: time.Unix(0, stableFile.ModTime), LastUploadedSHA256: previous.LastUploadedSHA256, RemoteETag: previous.RemoteETag, RemoteSize: previous.RemoteSize, RemoteMTime: previous.RemoteMTime, Status: "local-dirty"}
+					s.state.Sidecars[rel] = SidecarState{LocalSHA256: localHash, LocalSize: stableFile.Size, LocalMTime: time.Unix(0, stableFile.ModTime), LastUploadedSHA256: previous.LastUploadedSHA256, RemoteETag: previous.RemoteETag, RemoteSize: previous.RemoteSize, RemoteMTime: previous.RemoteMTime, MediaPath: mediaFor[rel], Status: "upload-failed", LastError: err.Error()}
 					s.logf("info", "sidecar upload failed path=%q error=%v", rel, err)
 					actionErrors = append(actionErrors, fmt.Errorf("upload sidecar %q: %w", rel, err))
 					continue
@@ -436,32 +329,22 @@ func (s *Service) reconcileSidecars(ctx context.Context, local map[string]localF
 			if needUpload || !known {
 				lastUploaded = localHash
 			}
-			s.state.Sidecars[rel] = SidecarState{LocalSHA256: localHash, LocalSize: stableFile.Size, LocalMTime: time.Unix(0, stableFile.ModTime), LastUploadedSHA256: lastUploaded, RemoteETag: remoteEntry.ETag, RemoteSize: remoteEntry.Size, RemoteMTime: remoteEntry.ModTime, Status: "synchronized"}
+			s.state.Sidecars[rel] = SidecarState{LocalSHA256: localHash, LocalSize: stableFile.Size, LocalMTime: time.Unix(0, stableFile.ModTime), LastUploadedSHA256: lastUploaded, RemoteETag: remoteEntry.ETag, RemoteSize: remoteEntry.Size, RemoteMTime: remoteEntry.ModTime, MediaPath: mediaFor[rel], Status: "synchronized"}
 			continue
 		}
-		if known && previous.LocalSHA256 != "" && !tombstoned {
-			s.state.Tombstones[rel] = Tombstone{DeletedAt: time.Now().UTC()}
-			previous.Status = "tombstoned"
-			s.state.Sidecars[rel] = previous
-			if err := s.store.Save(s.state); err != nil {
-				return errors.Join(errors.Join(actionErrors...), err)
-			}
-			s.logf("info", "sidecar tombstoned path=%q", rel)
-			continue
-		}
-		if tombstoned {
-			continue
-		}
-		if remoteExists && !known {
+		if remoteExists {
 			state, err := s.downloadSidecar(ctx, rel, remoteEntry)
 			if err != nil {
-				return err
+				previous.Status, previous.LastError = "download-failed", err.Error()
+				s.state.Sidecars[rel] = previous
+				actionErrors = append(actionErrors, err)
+				continue
 			}
+			state.MediaPath = mediaFor[rel]
 			s.state.Sidecars[rel] = state
-			s.logf("info", "sidecar downloaded path=%q size=%d", rel, remoteEntry.Size)
-		} else if known && !remoteExists {
-			previous.Status = "remote-missing"
-			s.state.Sidecars[rel] = previous
+			s.logf("info", "sidecar restored from remote path=%q media=%q size=%d remote_etag=%q", rel, mediaFor[rel], remoteEntry.Size, remoteEntry.ETag)
+		} else if known {
+			delete(s.state.Sidecars, rel)
 		}
 	}
 	return errors.Join(actionErrors...)
@@ -522,12 +405,11 @@ func (s *Service) stableLocalHash(ctx context.Context, rel string, initial local
 			return "", localFile{}, ctx.Err()
 		case <-time.After(s.config.SettleTime):
 		}
-		info, err := os.Stat(filename)
+		current, err := statLocal(s.config.LocalRoot, rel)
 		if err != nil {
 			return "", localFile{}, err
 		}
-		current := localFile{Path: rel, Size: info.Size(), ModTime: info.ModTime().UnixNano(), Mode: info.Mode()}
-		if current.Size == previous.Size && current.ModTime == previous.ModTime {
+		if sameLocalFile(current, previous) {
 			hash, err := hashLocalFile(filename)
 			return hash, current, err
 		}
@@ -538,7 +420,7 @@ func (s *Service) stableLocalHash(ctx context.Context, rel string, initial local
 	}
 }
 
-func (s *Service) uploadAndVerify(ctx context.Context, rel string, file localFile, wantHash string) (origin.Entry, error) {
+func (s *Service) uploadAndVerify(ctx context.Context, rel string, file localFile, _ string) (origin.Entry, error) {
 	filename := filepath.Join(s.config.LocalRoot, filepath.FromSlash(rel))
 	f, err := os.Open(filename)
 	if err != nil {
@@ -552,32 +434,10 @@ func (s *Service) uploadAndVerify(ctx context.Context, rel string, file localFil
 	if closeErr != nil {
 		return origin.Entry{}, closeErr
 	}
-	deadline := time.Now().Add(30 * time.Second)
-	delay := 250 * time.Millisecond
-	for {
-		gotHash, hashErr := hashRemote(ctx, s.origin, entry)
-		if hashErr == nil && gotHash == wantHash {
-			return entry, nil
-		}
-		if time.Now().After(deadline) {
-			if hashErr != nil {
-				return origin.Entry{}, fmt.Errorf("verify remote upload: %w", hashErr)
-			}
-			return origin.Entry{}, fmt.Errorf("verify remote upload: SHA-256 mismatch")
-		}
-		select {
-		case <-ctx.Done():
-			return origin.Entry{}, ctx.Err()
-		case <-time.After(delay):
-		}
-		if delay < 4*time.Second {
-			delay *= 2
-		}
-		entry, err = s.origin.Stat(ctx, rel)
-		if err != nil {
-			continue
-		}
+	if entry.Size != file.Size || entry.ETag == "" {
+		return origin.Entry{}, fmt.Errorf("verify sidecar upload: size=%d want=%d etag_present=%t", entry.Size, file.Size, entry.ETag != "")
 	}
+	return entry, nil
 }
 
 func sidecarContentType(rel string) string {

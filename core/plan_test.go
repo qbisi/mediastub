@@ -15,3 +15,24 @@ func TestPlanExtentsReturnsDeepCopy(t *testing.T) {
 		t.Fatalf("Plan was mutated through Extents: %+v", again)
 	}
 }
+
+func TestPlanHashIsStableAndContentSensitive(t *testing.T) {
+	first, err := NewPlan(16, []Extent{{Offset: 8, Data: []byte("tail")}, {Offset: 0, Data: []byte("head")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewPlan(16, []Extent{{Offset: 0, Data: []byte("head")}, {Offset: 8, Data: []byte("tail")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed, err := NewPlan(16, []Extent{{Offset: 0, Data: []byte("HEAD")}, {Offset: 8, Data: []byte("tail")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Hash() != second.Hash() {
+		t.Fatal("equivalent normalized plans have different hashes")
+	}
+	if first.Hash() == changed.Hash() {
+		t.Fatal("different plan content has the same hash")
+	}
+}

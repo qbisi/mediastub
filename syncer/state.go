@@ -11,26 +11,30 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const stateVersion = 1
+const stateVersion = 2
 
 type State struct {
-	Version    int                     `json:"version"`
-	Remote     string                  `json:"remote"`
-	LocalRoot  string                  `json:"localRoot"`
-	Media      map[string]MediaState   `json:"media"`
-	Sidecars   map[string]SidecarState `json:"sidecars"`
-	Tombstones map[string]Tombstone    `json:"tombstones"`
+	Version   int                     `json:"version"`
+	Remote    string                  `json:"remote"`
+	LocalRoot string                  `json:"localRoot"`
+	Media     map[string]MediaState   `json:"media"`
+	Sidecars  map[string]SidecarState `json:"sidecars"`
 }
 
 type MediaState struct {
-	Managed     bool      `json:"managed"`
-	Fingerprint string    `json:"fingerprint"`
-	ETag        string    `json:"etag,omitempty"`
-	Size        int64     `json:"size"`
-	RemoteMTime time.Time `json:"remoteMtime"`
-	LocalMTime  time.Time `json:"localMtime"`
-	LastSeen    time.Time `json:"lastSeen"`
-	Status      string    `json:"status"`
+	Managed       bool      `json:"managed"`
+	Fingerprint   string    `json:"fingerprint"`
+	ETag          string    `json:"etag,omitempty"`
+	Size          int64     `json:"size"`
+	RemoteMTime   time.Time `json:"remoteMtime"`
+	LocalMTime    time.Time `json:"localMtime"`
+	LocalSize     int64     `json:"localSize"`
+	MarkerVersion uint16    `json:"markerVersion,omitempty"`
+	PlanHash      string    `json:"planHash,omitempty"`
+	LastSeen      time.Time `json:"lastSeen"`
+	Status        string    `json:"status"`
+	LastError     string    `json:"lastError,omitempty"`
+	Transaction   string    `json:"transaction,omitempty"`
 }
 
 type SidecarState struct {
@@ -41,11 +45,9 @@ type SidecarState struct {
 	RemoteETag         string    `json:"remoteEtag,omitempty"`
 	RemoteSize         int64     `json:"remoteSize"`
 	RemoteMTime        time.Time `json:"remoteMtime"`
+	MediaPath          string    `json:"mediaPath,omitempty"`
 	Status             string    `json:"status"`
-}
-
-type Tombstone struct {
-	DeletedAt time.Time `json:"deletedAt"`
+	LastError          string    `json:"lastError,omitempty"`
 }
 
 type stateStore struct {
@@ -69,7 +71,7 @@ func openStateStore(dir, remote, localRoot string) (*stateStore, *State, error) 
 		return nil, nil, fmt.Errorf("lock state directory: %w", err)
 	}
 	store := &stateStore{dir: dir, lock: lock}
-	state := &State{Version: stateVersion, Remote: remote, LocalRoot: localRoot, Media: map[string]MediaState{}, Sidecars: map[string]SidecarState{}, Tombstones: map[string]Tombstone{}}
+	state := &State{Version: stateVersion, Remote: remote, LocalRoot: localRoot, Media: map[string]MediaState{}, Sidecars: map[string]SidecarState{}}
 	data, err := os.ReadFile(filepath.Join(dir, "state.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return store, state, nil
@@ -82,7 +84,7 @@ func openStateStore(dir, remote, localRoot string) (*stateStore, *State, error) 
 		store.Close()
 		return nil, nil, fmt.Errorf("decode state.json: %w", err)
 	}
-	if state.Version != stateVersion {
+	if state.Version != 1 && state.Version != stateVersion {
 		store.Close()
 		return nil, nil, fmt.Errorf("unsupported state version %d", state.Version)
 	}
@@ -96,9 +98,9 @@ func openStateStore(dir, remote, localRoot string) (*stateStore, *State, error) 
 	if state.Sidecars == nil {
 		state.Sidecars = map[string]SidecarState{}
 	}
-	if state.Tombstones == nil {
-		state.Tombstones = map[string]Tombstone{}
-	}
+	// Version 1 used sidecar tombstones. Dropping them intentionally restores
+	// missing local sidecars from the remote under the version 2 semantics.
+	state.Version = stateVersion
 	return store, state, nil
 }
 

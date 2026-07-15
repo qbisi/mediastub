@@ -223,10 +223,11 @@ mediastub mount REMOTE MOUNTPOINT --allow-other
 
 ## Sidecar synchronization
 
-`sync` is deliberately not a general two-way synchronization tool. Media files
-are authoritative on the remote and flow only remote to local. Sidecars are
-authoritative locally: local additions and changes are uploaded, while remote
-sidecars only fill a missing local file.
+`sync` is deliberately not a general two-way synchronization tool. Normally the
+remote media is authoritative and the local path contains a marked sparse stub.
+A downloader may atomically move a completed real media file onto that path;
+the unmarked file is then uploaded and replaced with a new stub. The downloader,
+not mediastub, is responsible for media integrity.
 
 ```sh
 mediastub sync \
@@ -254,9 +255,18 @@ must continue to match subsequent invocations.
 
 For every included remote Matroska or MP4 object, sync probes the remote using a
 fixed 16 MiB / 128 request / 256 KiB window budget and atomically creates a
-read-only ordinary sparse file. An existing media path is replaced only when it
-is already recorded as a managed stub. State loss therefore fails closed rather
-than overwriting a possible real local media file.
+read-only ordinary sparse file. Matroska/WebM stubs end in a legal EBML Void;
+MP4/M4V/MOV stubs end in a top-level `uuid` box. The trailer contains the remote
+logical size, hashed ETag and sparse-plan hash. A valid marker is never uploaded;
+an invalid marker is preserved and reported.
+
+An included local media file without a marker is treated as a completed download.
+Sync waits until inode, size and mtime are stable, probes it only to prepare the
+future stub, and PUTs it directly to the final remote path. After PUT it verifies
+only remote size and the presence of an ETag. It does not calculate a complete
+media hash or read the uploaded media back. Only then is the real local file
+atomically replaced by a marked sparse stub. Probe, upload or verification
+failure preserves the real local file.
 
 Recognized sidecars must share a directory and stem with a managed media file:
 
@@ -270,18 +280,21 @@ Recognized sidecars must share a directory and stem with a managed media file:
 The longest matching media stem wins. An equal-length ambiguity is logged and
 skipped. Other images and subtitles are not treated as sidecars.
 
-First synchronization is always `prefer-local`: differing local content
-overwrites the remote. Uploads use a direct PUT to the final path, followed by
-a complete SHA-256 read-back with bounded retries. This intentionally does not
-depend on `If-Match`, `If-None-Match`, `MOVE Overwrite:F`, or a remote temporary
-file. A duplicate remote path is logged with all available fingerprints and is
-skipped without selecting an object.
+Sidecars are locally authoritative when both copies exist: local additions and
+changes overwrite the remote, and a remotely missing sidecar is recreated from
+the local copy. Deleting a local sidecar does not express deletion intent; the
+next reconcile restores it from the remote. Upload verification uses size and
+ETag, without a post-upload content read-back.
 
-Deleting a local sidecar creates a persistent tombstone. It does not delete the
-remote object and the old remote copy is not downloaded again. Recreating the
-local path clears the tombstone and uploads it. Remote media and sidecar deletes
-are not propagated locally in v1. Every poll also performs a complete local
-scan, so missed filesystem notifications recover automatically.
+A confirmed remote media deletion removes a valid local stub and its associated
+local sidecars. It never removes an unmarked real local media file; that file is
+uploaded to recreate the remote and is replaced only after verification. An
+orphan remote sidecar is ignored until its media reappears. Sync never issues a
+remote DELETE, MOVE or COPY, and does not use tombstones, `If-Match`,
+`If-None-Match`, WebDAV LOCK or temporary-object MOVE publication. A duplicate
+remote path is logged with all fingerprints and skipped without selecting an
+object. Every remote scan is all-or-nothing, so a failed scan cannot propagate
+deletions.
 
 ## Probe policy
 
@@ -408,9 +421,9 @@ remain readable as their original bytes. `fail` instead makes an eligible file
 unopenable when its media probe fails. Files not selected by `--include` always
 pass through unchanged.
 
-The FUSE filesystem is unconditionally mounted read-only. Only `sync` writes
-recognized sidecars, and it never uploads local media or issues remote DELETE,
-MOVE or COPY operations.
+The FUSE filesystem is unconditionally mounted read-only. `sync` may upload
+recognized sidecars and unmarked completed media, but never issues remote
+DELETE, MOVE or COPY operations.
 
 ## Tests
 
@@ -449,12 +462,14 @@ archives should be reviewed as intentional fixture updates.
 
 - `core`: container detection and immutable sparse read plans; standard library
   only, and unaware of filesystems or HTTP.
-- `origin`: the namespace and random-read contract, plus the optional sidecar
+- `marker`: legal Matroska Void and MP4 uuid stub trailers.
+- `origin`: the namespace and random-read contract, plus the optional object
   PUT extension, with `local` and `webdav` implementations.
 - `pathfilter`: include parsing and `path.Match` behavior shared by both modes.
 - `mountfs`: policy, plan caching and the read-only go-fuse projection.
-- `syncer`: transactional scans, sparse materialization, sidecar classification,
-  tombstones, state, file watching and serialized reconciliation.
+- `syncer`: transactional scans, sparse materialization, media upload, deletion
+  propagation, sidecar classification, state, file watching and serialized
+  reconciliation.
 - `internal/sdnotify`: minimal systemd readiness notification.
 - `cmd/mediastub`: CLI wiring and lifecycle only.
 
