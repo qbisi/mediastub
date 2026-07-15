@@ -79,6 +79,7 @@ services independently:
     syncs.movies = {
       remote = "https://drive.example/dav/movies";
       localDirectory = "/srv/media/movies";
+      createLocalDirectory = true;
       environmentFile = config.sops.secrets.mediastub-movies.path;
       consumers = [ "jellyfin.service" ];
       group = "media";
@@ -104,11 +105,18 @@ normally required when a consumer runs as a different user.
 `include` is shared by mount and sync and renders one `--include` argument. A
 mount cannot combine typed `include` with a raw `--include` in `options`.
 Sync services run as `mediastub:mediastub` by default, use `Type=notify`, and
-allow consumers to start only after the initial reconcile. The module creates
-the private state directory, but intentionally does not create or change the
-owner/mode of `localDirectory`; create it separately and give the sync user and
-Jellyfin access through a shared group such as `media`. A sync-only
-configuration does not enable FUSE.
+allow consumers to start after the initial remote/local scans have produced a
+work plan. Stub generation and sidecar transfers then continue in the active
+daemon. A scan or planning failure prevents readiness; transfer failures after
+readiness are logged and retried by later reconciles. The module creates the
+private state directory. Set
+`createLocalDirectory = true` to also create `localDirectory` with
+systemd-tmpfiles; `directoryMode` defaults to `2775` so new sidecars inherit the
+configured group. `directoryUser` and `directoryGroup` default to the sync
+service identity but can differ when, for example, the service needs a WebDAV
+socket group while the directory is shared through `media`. Leave directory
+creation disabled for paths managed by another filesystem or module. A
+sync-only configuration does not enable FUSE.
 
 `environmentFile` is read at runtime by systemd. Basic authentication uses:
 
@@ -230,10 +238,19 @@ mediastub sync \
   /srv/media/movies
 ```
 
-Use `--once` for one complete remote scan, local scan and reconcile. The state
-directory is mandatory, must be absolute, and is locked so two processes cannot
-use it simultaneously. Its `Remote` and `LocalRoot` identity must continue to
-match subsequent invocations.
+By default, `sync` performs one complete remote scan, local scan and reconcile,
+then exits. Add `--daemon` to keep watching local changes and polling the remote:
+
+```sh
+mediastub sync --daemon \
+  --state-dir /var/lib/mediastub-movies \
+  https://drive.example/dav/movies \
+  /srv/media/movies
+```
+
+The state directory is mandatory, must be absolute, and is locked so two
+processes cannot use it simultaneously. Its `Remote` and `LocalRoot` identity
+must continue to match subsequent invocations.
 
 For every included remote Matroska or MP4 object, sync probes the remote using a
 fixed 16 MiB / 128 request / 256 KiB window budget and atomically creates a

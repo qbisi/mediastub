@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,12 +30,99 @@ func testMP4() []byte {
 
 func runOnce(t *testing.T, upstream origin.Origin, remote, local, state string) {
 	t.Helper()
-	service, err := New(upstream, Config{Remote: remote, LocalRoot: local, StateDir: state, Includes: []string{"*.mp4"}, PollInterval: time.Second, SettleTime: time.Millisecond, Once: true, Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0)})
+	service, err := New(upstream, Config{Remote: remote, LocalRoot: local, StateDir: state, Includes: []string{"*.mp4"}, PollInterval: time.Second, SettleTime: time.Millisecond, Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := service.Run(context.Background(), nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestReadyAfterPlanningBeforeApply(t *testing.T) {
+	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), testMP4(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(remoteDir, "movie.jpg"), []byte("poster"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := origin.NewLocal(remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	service, err := New(upstream, Config{
+		Remote: "file://" + remoteDir, LocalRoot: localDir, StateDir: stateDir,
+		Includes: []string{"*.mp4"}, PollInterval: time.Second, SettleTime: time.Millisecond,
+		Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyCalled := false
+	err = service.Run(context.Background(), func(status string) error {
+		readyCalled = true
+		if !strings.Contains(status, "media=1 sidecars=1") {
+			t.Fatalf("ready status = %q", status)
+		}
+		if _, err := os.Stat(filepath.Join(localDir, "movie.mp4")); !os.IsNotExist(err) {
+			t.Fatalf("stub existed before ready: %v", err)
+		}
+		if _, err := os.Stat(filepath.Join(localDir, "movie.jpg")); !os.IsNotExist(err) {
+			t.Fatalf("sidecar existed before ready: %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !readyCalled {
+		t.Fatal("ready callback was not called")
+	}
+	for _, name := range []string{"movie.mp4", "movie.jpg"} {
+		if _, err := os.Stat(filepath.Join(localDir, name)); err != nil {
+			t.Fatalf("planned file %q was not synchronized: %v", name, err)
+		}
+	}
+}
+
+func TestDaemonStaysReadyAfterInitialApplyFailure(t *testing.T) {
+	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), testMP4(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	poster := filepath.Join(remoteDir, "movie.jpg")
+	if err := os.WriteFile(poster, []byte("poster"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := origin.NewLocal(remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	service, err := New(upstream, Config{
+		Remote: "file://" + remoteDir, LocalRoot: localDir, StateDir: stateDir,
+		Includes: []string{"*.mp4"}, PollInterval: time.Hour, SettleTime: time.Millisecond,
+		Daemon: true, Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	err = service.Run(ctx, func(string) error {
+		if err := os.Remove(poster); err != nil {
+			return err
+		}
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("daemon exited after post-readiness apply failure: %v", err)
 	}
 }
 
@@ -219,7 +307,7 @@ func TestWatcherUploadsNewSidecar(t *testing.T) {
 	service, err := New(upstream, Config{
 		Remote: "file://" + remoteDir, LocalRoot: localDir, StateDir: t.TempDir(),
 		Includes: []string{"*.mp4"}, PollInterval: time.Hour, SettleTime: 10 * time.Millisecond,
-		Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0),
+		Daemon: true, Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +320,7 @@ func TestWatcherUploadsNewSidecar(t *testing.T) {
 	case <-ready:
 	case <-time.After(3 * time.Second):
 		cancel()
-		t.Fatal("initial reconcile did not become ready")
+		t.Fatal("initial synchronization plan did not become ready")
 	}
 	if err := os.WriteFile(filepath.Join(localDir, "movie.nfo"), []byte("watch upload"), 0o664); err != nil {
 		cancel()

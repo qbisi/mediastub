@@ -36,8 +36,9 @@ func (s *Service) logf(level, format string, args ...any) {
 	}
 }
 
-// Run performs the initial reconcile and then watches and polls until ctx ends.
-// ready is called only after the initial transaction has completed successfully.
+// Run performs one reconcile. In daemon mode it then watches and polls until
+// ctx ends. ready is called after the initial inputs have been scanned and the
+// work set has been planned, but before media and sidecar I/O begins.
 func (s *Service) Run(ctx context.Context, ready func(string) error) error {
 	if info, err := os.Stat(s.config.LocalRoot); err != nil || !info.IsDir() {
 		if err == nil {
@@ -54,23 +55,33 @@ func (s *Service) Run(ctx context.Context, ready func(string) error) error {
 
 	var events <-chan struct{}
 	var closeWatcher func() error
-	if !s.config.Once {
+	if s.config.Daemon {
 		events, closeWatcher, err = watchTree(ctx, s.config.LocalRoot, s.config.Logger, s.config.LogLevel)
 		if err != nil {
 			return err
 		}
 		defer closeWatcher()
 	}
-	if err := s.reconcile(ctx, true); err != nil {
-		return fmt.Errorf("initial reconcile: %w", err)
+	local, err := s.scanInputs(ctx, true)
+	if err != nil {
+		return fmt.Errorf("initial scan: %w", err)
 	}
 	if ready != nil {
-		if err := ready("Initial media synchronization completed"); err != nil {
+		media, sidecars := s.planWork(local)
+		s.logf("info", "initial synchronization planned media=%d sidecars=%d", media, sidecars)
+		if err := ready(fmt.Sprintf("Initial synchronization planned: media=%d sidecars=%d", media, sidecars)); err != nil {
 			return err
 		}
 	}
-	if s.config.Once {
+	applyErr := s.applyReconcile(ctx, local, true)
+	if !s.config.Daemon {
+		if applyErr != nil {
+			return fmt.Errorf("initial reconcile: %w", applyErr)
+		}
 		return nil
+	}
+	if applyErr != nil {
+		s.logf("info", "initial reconcile failed after readiness: %v", applyErr)
 	}
 
 	poll := time.NewTicker(s.config.PollInterval)
@@ -96,10 +107,18 @@ func (s *Service) Run(ctx context.Context, ready func(string) error) error {
 }
 
 func (s *Service) reconcile(ctx context.Context, refreshRemote bool) error {
+	local, err := s.scanInputs(ctx, refreshRemote)
+	if err != nil {
+		return err
+	}
+	return s.applyReconcile(ctx, local, refreshRemote)
+}
+
+func (s *Service) scanInputs(ctx context.Context, refreshRemote bool) (map[string]localFile, error) {
 	if refreshRemote || s.snapshot == nil {
 		snapshot, err := scanRemote(ctx, s.origin)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		s.snapshot = snapshot
 		s.logf("verbose", "remote scan complete entries=%d duplicate_paths=%d", len(snapshot.Entries), len(snapshot.Duplicates))
@@ -111,10 +130,14 @@ func (s *Service) reconcile(ctx context.Context, refreshRemote bool) error {
 	}
 	local, err := scanLocal(s.config.LocalRoot)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	s.logf("verbose", "local scan complete files=%d", len(local))
-	if err := s.reconcileMedia(ctx, local, refreshRemote); err != nil {
+	return local, nil
+}
+
+func (s *Service) applyReconcile(ctx context.Context, local map[string]localFile, remoteScan bool) error {
+	if err := s.reconcileMedia(ctx, local, remoteScan); err != nil {
 		return errors.Join(err, s.store.Save(s.state))
 	}
 	// Persist ownership of newly published stubs before sidecar I/O. Otherwise
@@ -122,12 +145,100 @@ func (s *Service) reconcile(ctx context.Context, refreshRemote bool) error {
 	if err := s.store.Save(s.state); err != nil {
 		return err
 	}
-	local, err = scanLocal(s.config.LocalRoot)
+	local, err := scanLocal(s.config.LocalRoot)
 	if err != nil {
 		return err
 	}
 	sidecarErr := s.reconcileSidecars(ctx, local)
 	return errors.Join(sidecarErr, s.store.Save(s.state))
+}
+
+func (s *Service) planWork(local map[string]localFile) (mediaCount, sidecarCount int) {
+	managed := make(map[string]bool)
+	for rel, media := range s.state.Media {
+		if media.Managed {
+			managed[rel] = true
+		}
+	}
+	for rel, entry := range s.snapshot.Entries {
+		if entry.IsDir || entry.Size <= 0 || !s.matcher.Match(rel) || s.duplicateBlocked(rel) {
+			continue
+		}
+		previous, tracked := s.state.Media[rel]
+		lf, exists := local[rel]
+		if (tracked && !previous.Managed && exists) || (!tracked && exists) {
+			continue
+		}
+		managed[rel] = true
+		valid := tracked && previous.Managed && exists && lf.Size == entry.Size && lf.Mode.Perm() == 0o444 && previous.Fingerprint == entry.Fingerprint() && time.Unix(0, lf.ModTime).Equal(previous.LocalMTime)
+		if !valid {
+			mediaCount++
+			s.logf("debug", "planned media path=%q", rel)
+		}
+	}
+	mediaPaths := make([]string, 0, len(managed))
+	for rel := range managed {
+		mediaPaths = append(mediaPaths, rel)
+	}
+	sort.Strings(mediaPaths)
+	remoteSidecars := make(map[string]origin.Entry)
+	localSidecars := make(map[string]localFile)
+	candidates := make(map[string]bool)
+	for rel, entry := range s.snapshot.Entries {
+		if entry.IsDir || s.matcher.Match(rel) {
+			continue
+		}
+		match := ClassifySidecar(rel, mediaPaths)
+		if !match.Ambiguous && match.MediaPath != "" {
+			remoteSidecars[rel] = entry
+			candidates[rel] = true
+		}
+	}
+	for rel := range local {
+		if s.matcher.Match(rel) {
+			continue
+		}
+		match := ClassifySidecar(rel, mediaPaths)
+		if !match.Ambiguous && match.MediaPath != "" {
+			localSidecars[rel] = local[rel]
+			candidates[rel] = true
+		}
+	}
+	for rel := range s.state.Sidecars {
+		candidates[rel] = true
+	}
+	for rel := range s.state.Tombstones {
+		candidates[rel] = true
+	}
+	for rel := range candidates {
+		if s.duplicateBlocked(rel) {
+			continue
+		}
+		lf, localExists := localSidecars[rel]
+		remoteEntry, remoteExists := remoteSidecars[rel]
+		previous, known := s.state.Sidecars[rel]
+		_, tombstoned := s.state.Tombstones[rel]
+		needsWork := false
+		switch {
+		case localExists:
+			localChanged := !known || previous.LocalSize != lf.Size || !previous.LocalMTime.Equal(time.Unix(0, lf.ModTime)) || previous.Status == "local-dirty"
+			remoteChanged := !remoteExists || !known || previous.RemoteETag != remoteEntry.ETag || previous.RemoteSize != remoteEntry.Size || !previous.RemoteMTime.Equal(remoteEntry.ModTime)
+			needsWork = tombstoned || localChanged || remoteChanged || (remoteExists && remoteEntry.ETag == "")
+		case known && previous.LocalSHA256 != "" && !tombstoned:
+			needsWork = true
+		case tombstoned:
+			needsWork = false
+		case remoteExists && !known:
+			needsWork = true
+		case known && !remoteExists:
+			needsWork = true
+		}
+		if needsWork {
+			sidecarCount++
+			s.logf("debug", "planned sidecar path=%q", rel)
+		}
+	}
+	return mediaCount, sidecarCount
 }
 
 func (s *Service) reconcileMedia(ctx context.Context, local map[string]localFile, remoteScan bool) error {

@@ -21,7 +21,7 @@ type Config struct {
 	PollInterval time.Duration
 	SettleTime   time.Duration
 	LogLevel     string
-	Once         bool
+	Daemon       bool
 	Budget       core.Budget
 	Logger       *log.Logger
 }

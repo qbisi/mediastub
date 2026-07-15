@@ -24,6 +24,10 @@
                 fsType = "tmpfs";
               };
               boot.loader.grub.devices = [ "nodev" ];
+              users.groups = {
+                media = { };
+                web = { };
+              };
               services.mediastub = {
                 enable = true;
                 mounts = nixpkgs.lib.optionalAttrs withMount {
@@ -38,8 +42,11 @@
                 syncs.check = {
                   remote = "https://example.invalid/dav/media";
                   localDirectory = "/srv/media";
+                  createLocalDirectory = true;
+                  directoryGroup = "media";
                   environmentFile = "/run/secrets/mediastub";
                   consumers = [ "media-server.service" ];
+                  group = "web";
                   include = [
                     "*.mkv"
                     "*.mp4"
@@ -79,10 +86,14 @@
           pkgs = evaluated.pkgs;
           unit = evaluated.config.systemd.units."mediastub-check.service".unit;
           syncUnit = evaluated.config.systemd.units."mediastub-sync-check.service".unit;
+          syncDirectory = syncOnly.config.systemd.tmpfiles.settings."10-mediastub"."/srv/media".d;
         in
         {
           module-eval =
             assert !syncOnly.config.programs.fuse.enable;
+            assert syncDirectory.mode == "2775";
+            assert syncDirectory.user == "mediastub";
+            assert syncDirectory.group == "media";
             pkgs.runCommand "mediastub-module-eval" { } ''
               unit=${unit}/mediastub-check.service
               sync_unit=${syncUnit}/mediastub-sync-check.service
@@ -94,8 +105,10 @@
               ${pkgs.gnugrep}/bin/grep -Fq "http+unix://%%2Frun%%2Fopenlist%%2Fsocket/dav/media" "$unit"
               ${pkgs.gnugrep}/bin/grep -Fq "Before=media-server.service" "$unit"
               ${pkgs.gnugrep}/bin/grep -Fq "Type=notify" "$sync_unit"
+              ${pkgs.gnugrep}/bin/grep -Fq "Group=web" "$sync_unit"
               ${pkgs.gnugrep}/bin/grep -Fq "StateDirectory=mediastub-sync-check" "$sync_unit"
               ${pkgs.gnugrep}/bin/grep -Fq "UMask=0002" "$sync_unit"
+              ${pkgs.gnugrep}/bin/grep -Fq -- "--daemon" "$sync_unit"
               ${pkgs.gnugrep}/bin/grep -Fq -- "--include=*.mkv,*.mp4" "$sync_unit"
               ${pkgs.gnugrep}/bin/grep -Fq -- "--poll-interval=300s" "$sync_unit"
               ${pkgs.gnugrep}/bin/grep -Fq -- "--settle-time=3s" "$sync_unit"

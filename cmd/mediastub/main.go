@@ -96,7 +96,7 @@ type syncOptions struct {
 	settleTime   time.Duration
 	stateDir     string
 	logLevel     string
-	once         bool
+	daemon       bool
 }
 
 func (o syncOptions) validate() error {
@@ -175,7 +175,7 @@ func parseSync(args []string, output io.Writer) (syncOptions, string, string, er
 	flags.DurationVar(&opts.settleTime, "settle-time", 3*time.Second, "time a local sidecar must remain unchanged")
 	flags.StringVar(&opts.stateDir, "state-dir", "", "absolute directory for state.json and the process lock (required)")
 	flags.StringVar(&opts.logLevel, "log-level", "info", "logging detail: info, verbose or debug")
-	flags.BoolVar(&opts.once, "once", false, "perform one complete reconcile and exit")
+	flags.BoolVar(&opts.daemon, "daemon", false, "continue applying the initial plan, then watch local changes and poll the remote")
 	flags.Usage = func() {
 		fmt.Fprintln(output, "Usage: mediastub sync [options] REMOTE LOCAL_DIRECTORY")
 		fmt.Fprintln(output, "Options may appear before or after REMOTE LOCAL_DIRECTORY.")
@@ -430,7 +430,7 @@ func syncCommand(args []string) error {
 	service, err := syncer.New(upstream, syncer.Config{
 		Remote: remote, LocalRoot: localDirectory, StateDir: opts.stateDir,
 		Includes: includes(opts.include), PollInterval: opts.pollInterval,
-		SettleTime: opts.settleTime, LogLevel: opts.logLevel, Once: opts.once,
+		SettleTime: opts.settleTime, LogLevel: opts.logLevel, Daemon: opts.daemon,
 		Budget: core.DefaultBudget, Logger: logger,
 	})
 	if err != nil {
@@ -439,6 +439,9 @@ func syncCommand(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	logger.Printf("synchronizing remote=%q local_directory=%q", remote, localDirectory)
+	if !opts.daemon {
+		return service.Run(ctx, nil)
+	}
 	return service.Run(ctx, func(status string) error {
 		logger.Printf("ready: %s", status)
 		return sdnotify.Ready(status)

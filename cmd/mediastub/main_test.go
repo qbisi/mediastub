@@ -105,13 +105,25 @@ func TestParseMountRequiresTwoArguments(t *testing.T) {
 func TestParseSync(t *testing.T) {
 	opts, remote, local, err := parseSync([]string{
 		"file:///srv/media", "/srv/stubs", "--state-dir", "/var/lib/mediastub-test",
-		"--include=*.mkv,Anime/*.mp4", "--poll-interval", "10m", "--settle-time=2s", "--once",
+		"--include=*.mkv,Anime/*.mp4", "--poll-interval", "10m", "--settle-time=2s", "--daemon",
 	}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if remote != "file:///srv/media" || local != "/srv/stubs" || opts.stateDir != "/var/lib/mediastub-test" || opts.pollInterval.String() != "10m0s" || opts.settleTime.String() != "2s" || !opts.once {
+	if remote != "file:///srv/media" || local != "/srv/stubs" || opts.stateDir != "/var/lib/mediastub-test" || opts.pollInterval.String() != "10m0s" || opts.settleTime.String() != "2s" || !opts.daemon {
 		t.Fatalf("parsed sync = %+v remote=%q local=%q", opts, remote, local)
+	}
+}
+
+func TestParseSyncDefaultsToOneReconcile(t *testing.T) {
+	opts, _, _, err := parseSync([]string{
+		"--state-dir=/state", "file:///srv/media", "/srv/stubs",
+	}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.daemon {
+		t.Fatal("sync unexpectedly defaulted to daemon mode")
 	}
 }
 
@@ -136,7 +148,7 @@ func TestParseSyncHelpAndRootHelp(t *testing.T) {
 	if _, _, _, err := parseSync([]string{"--help"}, &output); !errors.Is(err, flag.ErrHelp) {
 		t.Fatalf("help error = %v", err)
 	}
-	for _, want := range []string{"mediastub sync", "state-dir", "poll-interval", "settle-time", "once", webDAVTokenEnv} {
+	for _, want := range []string{"mediastub sync", "state-dir", "poll-interval", "settle-time", "daemon", webDAVTokenEnv} {
 		if !bytes.Contains(output.Bytes(), []byte(want)) {
 			t.Errorf("sync help missing %q", want)
 		}
