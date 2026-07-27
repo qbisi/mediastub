@@ -15,6 +15,7 @@ import (
 	"github.com/qbisi/mediastub/core"
 	"github.com/qbisi/mediastub/marker"
 	"github.com/qbisi/mediastub/origin"
+	"golang.org/x/sys/unix"
 )
 
 type putOverrideOrigin struct {
@@ -57,8 +58,27 @@ func testMP4() []byte {
 	return append(data, box("moov", nil)...)
 }
 
+func requireXattrs(t *testing.T) {
+	t.Helper()
+	name := filepath.Join(t.TempDir(), ".xattr-probe")
+	if err := os.WriteFile(name, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := unix.Setxattr(name, marker.XattrName, []byte{1}, 0)
+	if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) {
+		t.Skip("test filesystem does not support user xattrs")
+	}
+	if err != nil {
+		t.Fatalf("probe user xattr support: %v", err)
+	}
+	if err := unix.Removexattr(name, marker.XattrName); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func runOnce(t *testing.T, upstream origin.Origin, remote, local, state string) {
 	t.Helper()
+	requireXattrs(t)
 	service, err := New(upstream, Config{Remote: remote, LocalRoot: local, StateDir: state, Includes: []string{"*.mp4"}, PollInterval: time.Second, SettleTime: time.Millisecond, Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0)})
 	if err != nil {
 		t.Fatal(err)
@@ -69,6 +89,7 @@ func runOnce(t *testing.T, upstream origin.Origin, remote, local, state string) 
 }
 
 func TestReadyAfterPlanningBeforeApply(t *testing.T) {
+	requireXattrs(t)
 	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
 	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), testMP4(), 0o644); err != nil {
 		t.Fatal(err)
@@ -117,6 +138,7 @@ func TestReadyAfterPlanningBeforeApply(t *testing.T) {
 }
 
 func TestDaemonStaysReadyAfterInitialApplyFailure(t *testing.T) {
+	requireXattrs(t)
 	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
 	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), testMP4(), 0o644); err != nil {
 		t.Fatal(err)
@@ -180,15 +202,10 @@ func TestInitialReconcileAndSidecarRestore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stub.Size() <= int64(len(testMP4())) || stub.Mode().Perm() != 0o444 {
+	if stub.Size() != int64(len(testMP4())) || stub.Mode().Perm() != 0o444 {
 		t.Fatalf("stub = size %d mode %o", stub.Size(), stub.Mode().Perm())
 	}
-	f, err := os.Open(filepath.Join(localDir, "movie.mp4"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	markerResult, markerErr := marker.Inspect(f, stub.Size())
-	_ = f.Close()
+	markerResult, markerErr := marker.Inspect(filepath.Join(localDir, "movie.mp4"), stub.Size())
 	if markerErr != nil || markerResult.Status != marker.ValidMarker {
 		t.Fatalf("stub marker = %+v, %v", markerResult, markerErr)
 	}
@@ -297,12 +314,71 @@ func TestUntrackedLocalMediaUploadsAndBecomesStub(t *testing.T) {
 		t.Fatalf("local media was not uploaded: size=%d, %v", len(remoteMedia), err)
 	}
 	info, err := os.Stat(filepath.Join(localDir, "movie.mp4"))
-	if err != nil || info.Mode().Perm() != 0o444 || info.Size() <= int64(len(localMedia)) {
+	if err != nil || info.Mode().Perm() != 0o444 || info.Size() != int64(len(localMedia)) {
 		t.Fatalf("uploaded media did not become a stub: %+v, %v", info, err)
+	}
+	uploadedStatus, _, err := marker.InspectUploaded(filepath.Join(localDir, "movie.mp4"), info.Size(), info.ModTime())
+	if err != nil || uploadedStatus != marker.NoMarker {
+		t.Fatalf("stub retained uploaded marker: status=%d, %v", uploadedStatus, err)
+	}
+}
+
+func TestUploadedMediaWaitsForOtherUserXattrs(t *testing.T) {
+	requireXattrs(t)
+	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
+	localMedia := testMP4()
+	localName := filepath.Join(localDir, "movie.mp4")
+	if err := os.WriteFile(localName, localMedia, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(localName, "user.subrip", []byte("working"), 0); err != nil {
+		t.Fatal(err)
+	}
+	base, err := origin.NewLocal(remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer base.Close()
+	remote := "file://" + remoteDir
+	runOnce(t, base, remote, localDir, stateDir)
+	if got, err := os.ReadFile(filepath.Join(remoteDir, "movie.mp4")); err != nil || string(got) != string(localMedia) {
+		t.Fatalf("local media was not uploaded: size=%d, %v", len(got), err)
+	}
+	info, err := os.Stat(localName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stubMarker, err := marker.Inspect(localName, info.Size())
+	if err != nil || stubMarker.Status != marker.NoMarker {
+		t.Fatalf("blocked media was replaced with stub: %+v, %v", stubMarker, err)
+	}
+	uploadedStatus, _, err := marker.InspectUploaded(localName, info.Size(), info.ModTime())
+	if err != nil || uploadedStatus != marker.ValidMarker {
+		t.Fatalf("uploaded marker = %d, %v", uploadedStatus, err)
+	}
+	blockers, err := marker.BlockingUserXattrs(localName)
+	if err != nil || len(blockers) != 1 || blockers[0] != "user.subrip" {
+		t.Fatalf("blockers = %v, %v", blockers, err)
+	}
+	if err := unix.Removexattr(localName, "user.subrip"); err != nil {
+		t.Fatal(err)
+	}
+	noPut := &putOverrideOrigin{Origin: base, put: func(context.Context, string, io.Reader, int64, string) (origin.Entry, error) {
+		return origin.Entry{}, errors.New("uploaded media must not be uploaded again")
+	}}
+	runOnce(t, noPut, remote, localDir, stateDir)
+	info, err = os.Stat(localName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stubMarker, err = marker.Inspect(localName, info.Size())
+	if err != nil || stubMarker.Status != marker.ValidMarker {
+		t.Fatalf("media did not become stub after blocker removal: %+v, %v", stubMarker, err)
 	}
 }
 
 func TestLocalMediaProbeFailurePreservesFile(t *testing.T) {
+	requireXattrs(t)
 	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
 	remoteMedia := testMP4()
 	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), remoteMedia, 0o644); err != nil {
@@ -334,6 +410,7 @@ func TestLocalMediaProbeFailurePreservesFile(t *testing.T) {
 }
 
 func TestMediaPutFailurePreservesRealFile(t *testing.T) {
+	requireXattrs(t)
 	remoteDir, localDir := t.TempDir(), t.TempDir()
 	localMedia := testMP4()
 	localName := filepath.Join(localDir, "movie.mp4")
@@ -364,6 +441,7 @@ func TestMediaPutFailurePreservesRealFile(t *testing.T) {
 }
 
 func TestMediaVerifyFailurePreservesRealFile(t *testing.T) {
+	requireXattrs(t)
 	remoteDir, localDir := t.TempDir(), t.TempDir()
 	localMedia := testMP4()
 	localName := filepath.Join(localDir, "movie.mp4")
@@ -393,6 +471,7 @@ func TestMediaVerifyFailurePreservesRealFile(t *testing.T) {
 }
 
 func TestMediaChangeDuringUploadPreservesRealFile(t *testing.T) {
+	requireXattrs(t)
 	remoteDir, localDir := t.TempDir(), t.TempDir()
 	localMedia := testMP4()
 	localName := filepath.Join(localDir, "movie.mp4")
@@ -457,60 +536,8 @@ func TestTrackedStubIsReplacedWhenRemoteChanges(t *testing.T) {
 	}
 	runOnce(t, upstream, remote, localDir, stateDir)
 	info, err := os.Stat(filepath.Join(localDir, "movie.mp4"))
-	if err != nil || info.Size() <= int64(len(updated)) || info.Mode().Perm() != 0o444 {
+	if err != nil || info.Size() != int64(len(updated)) || info.Mode().Perm() != 0o444 {
 		t.Fatalf("updated stub = %+v, %v", info, err)
-	}
-}
-
-func TestTrackedLegacyStubIsMigratedWithoutUpload(t *testing.T) {
-	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
-	remoteMedia := testMP4()
-	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), remoteMedia, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	localName := filepath.Join(localDir, "movie.mp4")
-	if err := os.WriteFile(localName, make([]byte, len(remoteMedia)), 0o444); err != nil {
-		t.Fatal(err)
-	}
-	info, err := os.Stat(localName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	store, state, err := openStateStore(stateDir, "file://"+remoteDir, localDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state.Media["movie.mp4"] = MediaState{Managed: true, Size: int64(len(remoteMedia)), LocalMTime: info.ModTime(), Status: "active"}
-	if err := store.Save(state); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
-	}
-	base, err := origin.NewLocal(remoteDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer base.Close()
-	upstream := &putOverrideOrigin{Origin: base, put: func(context.Context, string, io.Reader, int64, string) (origin.Entry, error) {
-		return origin.Entry{}, errors.New("legacy stub must not be uploaded")
-	}}
-	runOnce(t, upstream, "file://"+remoteDir, localDir, stateDir)
-	info, err = os.Stat(localName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	f, err := os.Open(localName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, inspectErr := marker.Inspect(f, info.Size())
-	_ = f.Close()
-	if inspectErr != nil || result.Status != marker.ValidMarker {
-		t.Fatalf("legacy stub was not migrated: %+v, %v", result, inspectErr)
-	}
-	if got, err := os.ReadFile(filepath.Join(remoteDir, "movie.mp4")); err != nil || string(got) != string(remoteMedia) {
-		t.Fatalf("legacy migration changed remote media: size=%d, %v", len(got), err)
 	}
 }
 
@@ -529,10 +556,11 @@ func TestRemoteDeletionIsOverriddenByRealLocalMedia(t *testing.T) {
 	runOnce(t, upstream, remote, localDir, stateDir)
 	localMedia := append(append([]byte(nil), testMP4()...), []byte{0, 0, 0, 8, 'f', 'r', 'e', 'e'}...)
 	localName := filepath.Join(localDir, "movie.mp4")
-	if err := os.Chmod(localName, 0o644); err != nil {
+	downloadName := filepath.Join(localDir, ".movie.mp4.download")
+	if err := os.WriteFile(downloadName, localMedia, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(localName, localMedia, 0o644); err != nil {
+	if err := os.Rename(downloadName, localName); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Remove(remoteName); err != nil {
@@ -546,12 +574,7 @@ func TestRemoteDeletionIsOverriddenByRealLocalMedia(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := os.Open(localName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result, inspectErr := marker.Inspect(f, info.Size())
-	_ = f.Close()
+	result, inspectErr := marker.Inspect(localName, info.Size())
 	if inspectErr != nil || result.Status != marker.ValidMarker {
 		t.Fatalf("restored media did not become a valid stub: %+v, %v", result, inspectErr)
 	}
@@ -662,8 +685,7 @@ func TestInvalidMarkerIsPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data[len(data)-1] ^= 0xff
-	if err := os.WriteFile(localName, data, 0o644); err != nil {
+	if err := unix.Setxattr(localName, marker.XattrName, []byte("broken"), 0); err != nil {
 		t.Fatal(err)
 	}
 	runOnce(t, upstream, remote, localDir, stateDir)
@@ -683,7 +705,81 @@ func TestInvalidMarkerIsPreserved(t *testing.T) {
 	}
 }
 
+func TestDaemonFinalizesUploadedMediaAfterBlockerRemoval(t *testing.T) {
+	requireXattrs(t)
+	remoteDir, localDir := t.TempDir(), t.TempDir()
+	localName := filepath.Join(localDir, "movie.mp4")
+	if err := os.WriteFile(localName, testMP4(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(localName, "user.subrip", []byte("working"), 0); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := origin.NewLocal(remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	service, err := New(upstream, Config{
+		Remote: "file://" + remoteDir, LocalRoot: localDir, StateDir: t.TempDir(),
+		Includes: []string{"*.mp4"}, PollInterval: time.Hour, SettleTime: 10 * time.Millisecond,
+		Daemon: true, Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	ready := make(chan struct{})
+	go func() { done <- service.Run(ctx, func(string) error { close(ready); return nil }) }()
+	select {
+	case <-ready:
+	case <-time.After(3 * time.Second):
+		cancel()
+		t.Fatal("daemon did not become ready")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		info, statErr := os.Stat(localName)
+		if statErr == nil {
+			status, _, inspectErr := marker.InspectUploaded(localName, info.Size(), info.ModTime())
+			if inspectErr == nil && status == marker.ValidMarker {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("media was not marked uploaded")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := unix.Removexattr(localName, "user.subrip"); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		info, statErr := os.Stat(localName)
+		if statErr == nil {
+			result, inspectErr := marker.Inspect(localName, info.Size())
+			if inspectErr == nil && result.Status == marker.ValidMarker {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("media was not replaced after blocker removal")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWatcherUploadsNewSidecar(t *testing.T) {
+	requireXattrs(t)
 	remoteDir, localDir := t.TempDir(), t.TempDir()
 	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), testMP4(), 0o644); err != nil {
 		t.Fatal(err)

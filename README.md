@@ -55,6 +55,26 @@ the package from a NixOS flake:
 }
 ```
 
+### Automated flake updates
+
+The `Update flake inputs` GitHub Actions workflow runs every Monday at 03:17 UTC
+(11:17 Asia/Shanghai) and can also be started with `workflow_dispatch`. It
+updates all flake inputs, runs `nix flake check`, explicitly builds
+`packages.x86_64-linux.mediastub`, uploads newly built Nix store paths to
+Cachix, and commits `flake.lock` only after those steps succeed.
+
+Configure these under **Settings → Secrets and variables → Actions**:
+
+- repository variable `CACHIX_CACHE_NAME`: the Cachix cache name without the
+  `.cachix.org` suffix;
+- repository secret `CACHIX_AUTH_TOKEN`: a Cachix auth token with write access
+  to that cache.
+
+No separate GitHub credential is required. The workflow uses the automatically
+created `GITHUB_TOKEN` with job-scoped `contents: write`. If the default branch
+is protected, its rules must allow GitHub Actions to push this lockfile commit,
+or the final push step will be rejected.
+
 The module always adds the package overlay. It can manage mount and sync
 services independently:
 
@@ -255,18 +275,30 @@ must continue to match subsequent invocations.
 
 For every included remote Matroska or MP4 object, sync probes the remote using a
 fixed 16 MiB / 128 request / 256 KiB window budget and atomically creates a
-read-only ordinary sparse file. Matroska/WebM stubs end in a legal EBML Void;
-MP4/M4V/MOV stubs end in a top-level `uuid` box. The trailer contains the remote
-logical size, hashed ETag and sparse-plan hash. A valid marker is never uploaded;
-an invalid marker is preserved and reported.
+read-only ordinary sparse file whose logical size equals the remote media size.
+Stub metadata is stored in the `user.mediastub` extended attribute, including
+the marker version, container format, remote size, hashed ETag, sparse-plan hash
+and checksum. The local filesystem must support and preserve `user.*` xattrs.
+A valid marker is never uploaded; an invalid marker is preserved and reported.
+File contents and historical trailer formats are not inspected for marker data.
 
 An included local media file without a marker is treated as a completed download.
 Sync waits until inode, size and mtime are stable, probes it only to prepare the
 future stub, and PUTs it directly to the final remote path. After PUT it verifies
 only remote size and the presence of an ETag. It does not calculate a complete
-media hash or read the uploaded media back. Only then is the real local file
-atomically replaced by a marked sparse stub. Probe, upload or verification
-failure preserves the real local file.
+media hash or read the uploaded media back. Only then is the real local inode
+marked with `user.uploaded`. If that is its only `user.*` xattr, the file is
+immediately and atomically replaced by a marked sparse stub. Other `user.*`
+xattrs, such as `user.subrip`, keep the uploaded real file in place; daemon mode
+retries after an xattr change, and one-shot mode retries on its next run. System,
+security and ACL xattrs do not block replacement. The uploaded marker records
+the local size and mtime plus the verified remote ETag; an invalid marker or a
+missing or changed remote object causes a new upload. Probe, upload, verification
+or stub-generation failure preserves the real local file.
+
+Downloaders must replace the stub with an atomic rename. Truncating and rewriting
+the existing inode is unsupported because that operation preserves its xattr
+marker.
 
 Recognized sidecars must share a directory and stem with a managed media file:
 
@@ -462,7 +494,7 @@ archives should be reviewed as intentional fixture updates.
 
 - `core`: container detection and immutable sparse read plans; standard library
   only, and unaware of filesystems or HTTP.
-- `marker`: legal Matroska Void and MP4 uuid stub trailers.
+- `marker`: `user.mediastub` xattr encoding and validation.
 - `origin`: the namespace and random-read contract, plus the optional object
   PUT extension, with `local` and `webdav` implementations.
 - `pathfilter`: include parsing and `path.Match` behavior shared by both modes.

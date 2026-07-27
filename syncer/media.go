@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,10 +27,13 @@ const (
 	mediaVerifyFailed    = "verify-failed"
 	mediaProbeFailed     = "probe-failed"
 	mediaStubFailed      = "stub-generation-failed"
+	mediaUploadedWaiting = "uploaded-waiting-xattrs"
 	mediaInvalidMarker   = "invalid-marker"
 	mediaRemoteMissing   = "remote-missing"
 	mediaDuplicateRemote = "duplicate-remote-path"
 )
+
+var errUploadedXattrsPending = errors.New("uploaded media has blocking xattrs")
 
 type fileSource struct {
 	file *os.File
@@ -40,18 +44,7 @@ func (s *fileSource) Size() int64                             { return s.size }
 func (s *fileSource) ReadAt(p []byte, off int64) (int, error) { return s.file.ReadAt(p, off) }
 
 func inspectLocalMarker(root, rel string, file localFile) (marker.Result, error) {
-	f, err := os.Open(filepath.Join(root, filepath.FromSlash(rel)))
-	if err != nil {
-		return marker.Result{}, err
-	}
-	result, inspectErr := marker.Inspect(f, file.Size)
-	closeErr := f.Close()
-	return result, errors.Join(inspectErr, closeErr)
-}
-
-func legacyTrackedStub(previous MediaState, file localFile, remote origin.Entry) bool {
-	return previous.Managed && file.Mode.Perm() == 0o444 && file.Size == remote.Size &&
-		previous.Size == remote.Size && time.Unix(0, file.ModTime).Equal(previous.LocalMTime)
+	return marker.Inspect(filepath.Join(root, filepath.FromSlash(rel)), file.Size)
 }
 
 func markerMatchesRemote(found marker.Marker, remote origin.Entry) bool {
@@ -143,6 +136,100 @@ func allocatedBytes(info os.FileInfo) int64 {
 	return 0
 }
 
+func (s *Service) recordUploadedMedia(rel string, remote origin.Entry, local localFile, transaction string, now time.Time) {
+	s.state.Media[rel] = MediaState{
+		Managed: true, Fingerprint: remote.Fingerprint(), ETag: remote.ETag, Size: remote.Size,
+		RemoteMTime: remote.ModTime, LocalMTime: time.Unix(0, local.ModTime), LocalSize: local.Size,
+		LastSeen: now, Status: mediaUploadedWaiting, Transaction: transaction,
+	}
+}
+
+func (s *Service) finalizeUploadedMedia(ctx context.Context, rel string, local localFile, remote origin.Entry, transaction string, now time.Time, probe *core.Result) error {
+	filename := filepath.Join(s.config.LocalRoot, filepath.FromSlash(rel))
+	blockers, err := marker.BlockingUserXattrs(filename)
+	if err != nil {
+		return fmt.Errorf("list uploaded media xattrs %q: %w", rel, err)
+	}
+	if len(blockers) != 0 {
+		s.recordUploadedMedia(rel, remote, local, transaction, now)
+		s.logf("info", "media uploaded waiting for xattrs transaction=%q path=%q blockers=%q", transaction, rel, strings.Join(blockers, ","))
+		return nil
+	}
+	current, err := statLocal(s.config.LocalRoot, rel)
+	if err != nil {
+		return err
+	}
+	if !sameLocalFile(local, current) {
+		return errors.New("local file changed before stub replacement")
+	}
+	if probe == nil {
+		file, err := os.Open(filename)
+		if err != nil {
+			return err
+		}
+		probe, err = core.Probe(&fileSource{file: file, size: current.Size}, s.config.Budget)
+		closeErr := file.Close()
+		if err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			previous := s.state.Media[rel]
+			previous.Status, previous.LastError = mediaProbeFailed, err.Error()
+			s.state.Media[rel] = previous
+			return fmt.Errorf("probe uploaded media %q: %w", rel, err)
+		}
+	}
+	// Building a sparse stub can take long enough for another worker to add a
+	// coordination xattr. Recheck both the source inode and its xattrs at the
+	// last point before the atomic rename.
+	var pendingBlockers []string
+	beforeRename := func() error {
+		latest, err := statLocal(s.config.LocalRoot, rel)
+		if err != nil {
+			return err
+		}
+		if !sameLocalFile(current, latest) {
+			return errors.New("local file changed before stub replacement")
+		}
+		pendingBlockers, err = marker.BlockingUserXattrs(filename)
+		if err != nil {
+			return fmt.Errorf("recheck uploaded media xattrs %q: %w", rel, err)
+		}
+		if len(pendingBlockers) != 0 {
+			return errUploadedXattrsPending
+		}
+		return nil
+	}
+	if err := materializePlanGuarded(ctx, s.config.LocalRoot, rel, probe, remote.ETag, remote.ModTime, beforeRename); err != nil {
+		if errors.Is(err, errUploadedXattrsPending) {
+			s.recordUploadedMedia(rel, remote, current, transaction, now)
+			s.logf("info", "media uploaded waiting for xattrs transaction=%q path=%q blockers=%q", transaction, rel, strings.Join(pendingBlockers, ","))
+			return nil
+		}
+		previous := s.state.Media[rel]
+		previous.Status, previous.LastError = mediaStubFailed, err.Error()
+		s.state.Media[rel] = previous
+		return fmt.Errorf("replace uploaded media %q with stub: %w", rel, err)
+	}
+	stub, err := statLocal(s.config.LocalRoot, rel)
+	if err != nil {
+		return err
+	}
+	found, err := inspectLocalMarker(s.config.LocalRoot, rel, stub)
+	if err != nil {
+		return fmt.Errorf("verify uploaded media marker %q: %w", rel, err)
+	}
+	if found.Status != marker.ValidMarker {
+		return fmt.Errorf("verify uploaded media marker %q: status=%d", rel, found.Status)
+	}
+	s.recordRemoteStub(rel, remote, stub, found.Marker, now)
+	s.snapshot.Entries[rel] = remote
+	if info, err := os.Stat(filepath.Join(s.config.LocalRoot, filepath.FromSlash(rel))); err == nil {
+		s.logf("info", "media replaced with stub transaction=%q path=%q remote_size=%d stub_size=%d allocated_bytes=%d", transaction, rel, remote.Size, info.Size(), allocatedBytes(info))
+	}
+	return nil
+}
+
 func (s *Service) uploadLocalMedia(ctx context.Context, rel string, initial localFile, now time.Time) error {
 	transaction := randomSuffix()
 	previous := s.state.Media[rel]
@@ -213,28 +300,18 @@ func (s *Service) uploadLocalMedia(ctx context.Context, rel string, initial loca
 		return err
 	}
 	s.logf("info", "media upload verified transaction=%q path=%q local_size=%d remote_size=%d remote_etag=%q", transaction, rel, stable.Size, remote.Size, remote.ETag)
-	if err := materializePlan(ctx, s.config.LocalRoot, rel, probe, remote.ETag, remote.ModTime); err != nil {
-		previous.Status, previous.LastError = mediaStubFailed, err.Error()
+	if err := marker.SetUploaded(filename, stable.Size, time.Unix(0, stable.ModTime), remote.ETag); err != nil {
+		previous.Status, previous.LastError = mediaVerifyFailed, err.Error()
 		s.state.Media[rel] = previous
-		return fmt.Errorf("replace uploaded media %q with stub: %w", rel, err)
+		return fmt.Errorf("mark uploaded media %q: %w", rel, err)
 	}
-	local, err := statLocal(s.config.LocalRoot, rel)
-	if err != nil {
+	s.recordUploadedMedia(rel, remote, stable, transaction, now)
+	s.snapshot.Entries[rel] = remote
+	if err := s.store.Save(s.state); err != nil {
 		return err
 	}
-	found, err := inspectLocalMarker(s.config.LocalRoot, rel, local)
-	if err != nil {
-		return fmt.Errorf("verify uploaded media marker %q: %w", rel, err)
-	}
-	if found.Status != marker.ValidMarker {
-		return fmt.Errorf("verify uploaded media marker %q: status=%d", rel, found.Status)
-	}
-	s.recordRemoteStub(rel, remote, local, found.Marker, now)
-	s.snapshot.Entries[rel] = remote
-	if info, err := os.Stat(filepath.Join(s.config.LocalRoot, filepath.FromSlash(rel))); err == nil {
-		s.logf("info", "media replaced with stub transaction=%q path=%q remote_size=%d stub_size=%d allocated_bytes=%d", transaction, rel, remote.Size, info.Size(), allocatedBytes(info))
-	}
-	return nil
+	s.logf("info", "media marked uploaded transaction=%q path=%q xattr=%q", transaction, rel, marker.UploadedXattrName)
+	return s.finalizeUploadedMedia(ctx, rel, stable, remote, transaction, now, probe)
 }
 
 func (s *Service) confirmRemoteMissing(ctx context.Context, rel string) (bool, error) {
@@ -246,6 +323,41 @@ func (s *Service) confirmRemoteMissing(ctx context.Context, rel string) (bool, e
 		return false, err
 	}
 	return false, nil
+}
+
+func uploadedMatchesRemote(uploaded marker.UploadedMarker, remote origin.Entry) bool {
+	return uploaded.LocalSize == uint64(remote.Size) &&
+		uploaded.RemoteETagHash == marker.ETagHash(remote.ETag)
+}
+
+func (s *Service) resumeUploadedMedia(ctx context.Context, rel string, local localFile, remote origin.Entry, remoteExists bool, now time.Time) (bool, error) {
+	filename := filepath.Join(s.config.LocalRoot, filepath.FromSlash(rel))
+	status, uploaded, err := marker.InspectUploaded(filename, local.Size, time.Unix(0, local.ModTime))
+	if err != nil {
+		return true, fmt.Errorf("inspect uploaded media %q: %w", rel, err)
+	}
+	if status == marker.NoMarker {
+		return false, nil
+	}
+	if status == marker.InvalidMarker || !remoteExists || !uploadedMatchesRemote(uploaded, remote) {
+		if err := marker.RemoveUploaded(filename); err != nil {
+			return true, fmt.Errorf("clear stale uploaded marker %q: %w", rel, err)
+		}
+		reason := "invalid"
+		if status == marker.ValidMarker && !remoteExists {
+			reason = "remote-missing"
+		} else if status == marker.ValidMarker {
+			reason = "remote-changed"
+		}
+		s.logf("info", "media uploaded marker cleared path=%q reason=%s action=reupload", rel, reason)
+		return false, nil
+	}
+	transaction := s.state.Media[rel].Transaction
+	if transaction == "" {
+		transaction = randomSuffix()
+	}
+	s.recordUploadedMedia(rel, remote, local, transaction, now)
+	return true, s.finalizeUploadedMedia(ctx, rel, local, remote, transaction, now, nil)
 }
 
 func (s *Service) removeLocalMediaUnit(rel string) error {
@@ -351,10 +463,11 @@ func (s *Service) reconcileMediaFiles(ctx context.Context, local map[string]loca
 			s.state.Media[rel] = previous
 			s.logf("info", "invalid-marker path=%q", rel)
 		case marker.NoMarker:
-			if remoteExists && tracked && legacyTrackedStub(previous, file, remote) {
-				if err := s.materializeRemote(ctx, rel, remote, now); err != nil {
-					actionErrors = append(actionErrors, err)
-				}
+			handled, resumeErr := s.resumeUploadedMedia(ctx, rel, file, remote, remoteExists, now)
+			if resumeErr != nil {
+				actionErrors = append(actionErrors, resumeErr)
+			}
+			if handled {
 				continue
 			}
 			if !remoteExists && remoteScan && tracked {

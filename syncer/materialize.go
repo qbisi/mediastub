@@ -51,6 +51,10 @@ func randomSuffix() string {
 }
 
 func materializePlan(ctx context.Context, root, rel string, result *core.Result, remoteETag string, mtime time.Time) error {
+	return materializePlanGuarded(ctx, root, rel, result, remoteETag, mtime, nil)
+}
+
+func materializePlanGuarded(ctx context.Context, root, rel string, result *core.Result, remoteETag string, mtime time.Time, beforeRename func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -65,12 +69,6 @@ func materializePlan(ctx context.Context, root, rel string, result *core.Result,
 		return err
 	}
 	cleanup := func() { _ = os.Remove(tmp) }
-	trailer, err := marker.Trailer(result.Format, result.Plan.Size(), remoteETag, result.Plan.Hash())
-	if err != nil {
-		_ = f.Close()
-		cleanup()
-		return err
-	}
 	if err = f.Truncate(result.Plan.Size()); err == nil {
 		for _, extent := range result.Plan.Extents() {
 			if err = ctx.Err(); err != nil {
@@ -87,11 +85,7 @@ func materializePlan(ctx context.Context, root, rel string, result *core.Result,
 		}
 	}
 	if err == nil {
-		var n int
-		n, err = f.WriteAt(trailer, result.Plan.Size())
-		if err == nil && n != len(trailer) {
-			err = io.ErrShortWrite
-		}
+		err = marker.Set(tmp, result.Format, result.Plan.Size(), remoteETag, result.Plan.Hash())
 	}
 	if err == nil {
 		err = f.Sync()
@@ -108,6 +102,12 @@ func materializePlan(ctx context.Context, root, rel string, result *core.Result,
 	if err != nil {
 		cleanup()
 		return err
+	}
+	if beforeRename != nil {
+		if err := beforeRename(); err != nil {
+			cleanup()
+			return err
+		}
 	}
 	if err := os.Rename(tmp, target); err != nil {
 		cleanup()
