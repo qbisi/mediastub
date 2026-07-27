@@ -24,6 +24,7 @@ jobs:
           - system: aarch64-linux
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    environment: cachix
     permissions:
       contents: read
 

@@ -68,18 +68,21 @@ Nix store paths to Cachix. GitHub does not emit a `push` workflow run for commit
 pushed with `GITHUB_TOKEN`, so a successful scheduled lockfile update sends a
 `repository_dispatch` event to the same build workflow.
 
-Configure these under **Settings → Secrets and variables → Actions**:
+Create the `cachix` environment under **Settings → Environments**, then
+configure these values on that environment:
 
-- repository variable `CACHIX_CACHE_NAME`: the Cachix cache name without the
+- environment variable `CACHIX_CACHE_NAME`: the Cachix cache name without the
   `.cachix.org` suffix;
-- repository secret `CACHIX_AUTH_TOKEN`: a Cachix auth token with write access
+- environment secret `CACHIX_AUTH_TOKEN`: a Cachix auth token with write access
   to that cache.
 
-No separate GitHub credential is required. The update workflow uses the
-automatically created `GITHUB_TOKEN` with job-scoped `contents: write`; build
-jobs use `contents: read`. If the default branch is protected, its rules must
-allow GitHub Actions to push the lockfile commit, or the final update step will
-be rejected.
+Both architecture jobs explicitly use `environment: cachix`. Any deployment
+protection rules configured on that environment therefore apply before the jobs
+can read its variables and secrets. No separate GitHub credential is required.
+The update workflow uses the automatically created `GITHUB_TOKEN` with
+job-scoped `contents: write`; build jobs use `contents: read`. If the default
+branch is protected, its rules must allow GitHub Actions to push the lockfile
+commit, or the final update step will be rejected.
 
 The module always adds the package overlay. It can manage mount and sync
 services independently:
