@@ -58,10 +58,15 @@ the package from a NixOS flake:
 ### Automated flake updates
 
 The `Update flake inputs` GitHub Actions workflow runs every Monday at 03:17 UTC
-(11:17 Asia/Shanghai) and can also be started with `workflow_dispatch`. It
-updates all flake inputs, runs `nix flake check`, explicitly builds
-`packages.x86_64-linux.mediastub`, uploads newly built Nix store paths to
-Cachix, and commits `flake.lock` only after those steps succeed.
+(11:17 Asia/Shanghai) and can also be started with `workflow_dispatch`. It only
+updates and commits `flake.lock`.
+
+The separate `Build master` workflow runs for every push to `master`. It checks
+the flake and builds `mediastub` natively for both `x86_64-linux` on
+`ubuntu-24.04` and `aarch64-linux` on `ubuntu-24.04-arm`, uploading newly built
+Nix store paths to Cachix. GitHub does not emit a `push` workflow run for commits
+pushed with `GITHUB_TOKEN`, so a successful scheduled lockfile update sends a
+`repository_dispatch` event to the same build workflow.
 
 Configure these under **Settings → Secrets and variables → Actions**:
 
@@ -70,10 +75,11 @@ Configure these under **Settings → Secrets and variables → Actions**:
 - repository secret `CACHIX_AUTH_TOKEN`: a Cachix auth token with write access
   to that cache.
 
-No separate GitHub credential is required. The workflow uses the automatically
-created `GITHUB_TOKEN` with job-scoped `contents: write`. If the default branch
-is protected, its rules must allow GitHub Actions to push this lockfile commit,
-or the final push step will be rejected.
+No separate GitHub credential is required. The update workflow uses the
+automatically created `GITHUB_TOKEN` with job-scoped `contents: write`; build
+jobs use `contents: read`. If the default branch is protected, its rules must
+allow GitHub Actions to push the lockfile commit, or the final update step will
+be rejected.
 
 The module always adds the package overlay. It can manage mount and sync
 services independently:

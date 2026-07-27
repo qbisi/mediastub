@@ -1,0 +1,63 @@
+name: Build master
+
+on:
+  push:
+    branches:
+      - master
+  repository_dispatch:
+    types:
+      - flake-inputs-updated
+
+concurrency:
+  group: build-master
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.system }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          github_access_token: ${{ github.token }}
+
+      - name: Check Cachix configuration
+        env:
+          CACHIX_CACHE_NAME: ${{ vars.CACHIX_CACHE_NAME }}
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+        run: |
+          test -n "$CACHIX_CACHE_NAME" || {
+            echo "::error::Set the CACHIX_CACHE_NAME repository variable."
+            exit 1
+          }
+          test -n "$CACHIX_AUTH_TOKEN" || {
+            echo "::error::Set the CACHIX_AUTH_TOKEN repository secret."
+            exit 1
+          }
+
+      - name: Configure Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: ${{ vars.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Check flake
+        run: nix flake check --print-build-logs
+
+      - name: Build mediastub
+        run: nix build ".#packages.${{ matrix.system }}.mediastub" --print-build-logs

@@ -10,8 +10,8 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  update-build-cache:
-    name: Update, build, and cache
+  update:
+    name: Update lock file
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -19,45 +19,23 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: master
 
       - name: Install Nix
         uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
         with:
           github_access_token: ${{ github.token }}
 
-      - name: Check Cachix configuration
-        env:
-          CACHIX_CACHE_NAME: ${{ vars.CACHIX_CACHE_NAME }}
-          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        run: |
-          test -n "$CACHIX_CACHE_NAME" || {
-            echo "::error::Set the CACHIX_CACHE_NAME repository variable."
-            exit 1
-          }
-          test -n "$CACHIX_AUTH_TOKEN" || {
-            echo "::error::Set the CACHIX_AUTH_TOKEN repository secret."
-            exit 1
-          }
-
-      - name: Configure Cachix
-        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: ${{ vars.CACHIX_CACHE_NAME }}
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-
       - name: Update flake inputs
         run: nix flake update
 
-      - name: Check flake
-        run: nix flake check --print-build-logs
-
-      - name: Build mediastub
-        run: nix build .#packages.x86_64-linux.mediastub --print-build-logs
-
       - name: Commit updated lock file
+        id: commit
         run: |
           if git diff --quiet -- flake.lock; then
             echo "flake.lock is already up to date."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -65,4 +43,16 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add flake.lock
           git commit -m "flake.lock: update inputs"
-          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin HEAD:master
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      # GITHUB_TOKEN pushes do not emit another push workflow run. Dispatch an
+      # explicit event only after a changed lock file has reached master.
+      - name: Trigger master build
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh api --method POST
+          "repos/${GITHUB_REPOSITORY}/dispatches"
+          -f event_type=flake-inputs-updated
