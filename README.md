@@ -63,9 +63,10 @@ updates and commits `flake.lock`.
 
 The separate `Build master` workflow runs for every push to `master`. It checks
 the flake and builds `mediastub` natively for both `x86_64-linux` on
-`ubuntu-24.04` and `aarch64-linux` on `ubuntu-24.04-arm`, uploading newly built
-Nix store paths to Cachix. GitHub does not emit a `push` workflow run for commits
-pushed with `GITHUB_TOKEN`, so a successful scheduled lockfile update sends a
+`ubuntu-24.04` and `aarch64-linux` on `ubuntu-24.04-arm`. The checks are not
+uploaded: Cachix only pushes the final `result` symlink and its runtime closure.
+GitHub does not emit a `push` workflow run for commits pushed with
+`GITHUB_TOKEN`, so a successful scheduled lockfile update sends a
 `repository_dispatch` event to the same build workflow.
 
 Create the `cachix` environment under **Settings → Environments**, then
