@@ -30,10 +30,20 @@ func TestUploadedMarkerAndBlockers(t *testing.T) {
 		t.Fatal(err)
 	}
 	blockers, err = BlockingUserXattrs(name)
-	if err != nil || len(blockers) != 1 || blockers[0] != "user.subrip" {
+	if err != nil || len(blockers) != 0 {
+		t.Fatalf("unrelated xattr blockers = %v, %v", blockers, err)
+	}
+	if err := unix.Setxattr(name, KeepXattrName, []byte("1"), 0); err != nil {
+		t.Fatal(err)
+	}
+	blockers, err = BlockingUserXattrs(name)
+	if err != nil || len(blockers) != 1 || blockers[0] != KeepXattrName {
 		t.Fatalf("blockers = %v, %v", blockers, err)
 	}
 	if err := unix.Removexattr(name, "user.subrip"); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Removexattr(name, KeepXattrName); err != nil {
 		t.Fatal(err)
 	}
 	if err := RemoveUploaded(name); err != nil {

@@ -323,7 +323,7 @@ func TestUntrackedLocalMediaUploadsAndBecomesStub(t *testing.T) {
 	}
 }
 
-func TestUploadedMediaWaitsForOtherUserXattrs(t *testing.T) {
+func TestUploadedMediaWaitsForKeepXattr(t *testing.T) {
 	requireXattrs(t)
 	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
 	localMedia := testMP4()
@@ -331,7 +331,7 @@ func TestUploadedMediaWaitsForOtherUserXattrs(t *testing.T) {
 	if err := os.WriteFile(localName, localMedia, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Setxattr(localName, "user.subrip", []byte("working"), 0); err != nil {
+	if err := unix.Setxattr(localName, marker.KeepXattrName, []byte("1"), 0); err != nil {
 		t.Fatal(err)
 	}
 	base, err := origin.NewLocal(remoteDir)
@@ -357,10 +357,10 @@ func TestUploadedMediaWaitsForOtherUserXattrs(t *testing.T) {
 		t.Fatalf("uploaded marker = %d, %v", uploadedStatus, err)
 	}
 	blockers, err := marker.BlockingUserXattrs(localName)
-	if err != nil || len(blockers) != 1 || blockers[0] != "user.subrip" {
+	if err != nil || len(blockers) != 1 || blockers[0] != marker.KeepXattrName {
 		t.Fatalf("blockers = %v, %v", blockers, err)
 	}
-	if err := unix.Removexattr(localName, "user.subrip"); err != nil {
+	if err := unix.Removexattr(localName, marker.KeepXattrName); err != nil {
 		t.Fatal(err)
 	}
 	noPut := &putOverrideOrigin{Origin: base, put: func(context.Context, string, io.Reader, int64, string) (origin.Entry, error) {
@@ -712,7 +712,7 @@ func TestDaemonFinalizesUploadedMediaAfterBlockerRemoval(t *testing.T) {
 	if err := os.WriteFile(localName, testMP4(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Setxattr(localName, "user.subrip", []byte("working"), 0); err != nil {
+	if err := unix.Setxattr(localName, marker.KeepXattrName, []byte("1"), 0); err != nil {
 		t.Fatal(err)
 	}
 	upstream, err := origin.NewLocal(remoteDir)
@@ -753,7 +753,7 @@ func TestDaemonFinalizesUploadedMediaAfterBlockerRemoval(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if err := unix.Removexattr(localName, "user.subrip"); err != nil {
+	if err := unix.Removexattr(localName, marker.KeepXattrName); err != nil {
 		cancel()
 		t.Fatal(err)
 	}

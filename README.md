@@ -291,11 +291,11 @@ Sync waits until inode, size and mtime are stable, probes it only to prepare the
 future stub, and PUTs it directly to the final remote path. After PUT it verifies
 only remote size and the presence of an ETag. It does not calculate a complete
 media hash or read the uploaded media back. Only then is the real local inode
-marked with `user.uploaded`. If that is its only `user.*` xattr, the file is
-immediately and atomically replaced by a marked sparse stub. Other `user.*`
-xattrs, such as `user.subrip`, keep the uploaded real file in place; daemon mode
-retries after an xattr change, and one-shot mode retries on its next run. System,
-security and ACL xattrs do not block replacement. The uploaded marker records
+marked with `user.uploaded`. Unless `user.keep` is present, the file is
+immediately and atomically replaced by a marked sparse stub. `user.keep` keeps
+the uploaded real file in place; daemon mode retries after the attribute is
+removed, and one-shot mode retries on its next run. Other user, system, security,
+and ACL xattrs do not block replacement. The uploaded marker records
 the local size and mtime plus the verified remote ETag; an invalid marker or a
 missing or changed remote object causes a new upload. Probe, upload, verification
 or stub-generation failure preserves the real local file.

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"sort"
 	"strings"
 	"time"
 
@@ -13,9 +12,12 @@ import (
 )
 
 const (
-	// UploadedXattrName marks a verified real-media upload that is waiting for
-	// other user xattrs to be removed before it can be replaced by a stub.
+	// UploadedXattrName marks a verified real-media upload that can be replaced
+	// by a stub unless KeepXattrName is present.
 	UploadedXattrName = "user.uploaded"
+	// KeepXattrName prevents an uploaded real-media inode from being replaced
+	// by a stub while the attribute is present.
+	KeepXattrName = "user.keep"
 
 	uploadedVersion   = uint16(1)
 	uploadedValueSize = 2 + 2 + 8 + 8 + 32 + 4
@@ -119,8 +121,8 @@ func RemoveUploaded(path string) error {
 	return nil
 }
 
-// BlockingUserXattrs returns user namespace attributes other than the uploaded
-// handoff marker. System ACL and security xattrs do not block stub replacement.
+// BlockingUserXattrs returns KeepXattrName when it is present. Other user,
+// system, ACL, and security xattrs do not block stub replacement.
 func BlockingUserXattrs(path string) ([]string, error) {
 	size, err := unix.Listxattr(path, nil)
 	if err != nil {
@@ -136,10 +138,9 @@ func BlockingUserXattrs(path string) ([]string, error) {
 	}
 	var blockers []string
 	for _, name := range strings.Split(string(buf[:n]), "\x00") {
-		if strings.HasPrefix(name, "user.") && name != UploadedXattrName {
+		if name == KeepXattrName {
 			blockers = append(blockers, name)
 		}
 	}
-	sort.Strings(blockers)
 	return blockers, nil
 }
