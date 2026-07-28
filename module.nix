@@ -87,26 +87,6 @@ let
         description = "Local directory containing sparse stubs and sidecars.";
         example = "/srv/media/movies";
       };
-      createLocalDirectory = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = "Whether to create localDirectory with systemd-tmpfiles.";
-      };
-      directoryMode = lib.mkOption {
-        type = lib.types.strMatching "[0-7]{3,4}";
-        default = "2775";
-        description = "Mode used when createLocalDirectory is enabled.";
-      };
-      directoryUser = lib.mkOption {
-        type = lib.types.nullOr nonEmptyString;
-        default = null;
-        description = "Owner of a managed localDirectory; null inherits user.";
-      };
-      directoryGroup = lib.mkOption {
-        type = lib.types.nullOr nonEmptyString;
-        default = null;
-        description = "Group of a managed localDirectory; null inherits group.";
-      };
       pollInterval = lib.mkOption {
         type = lib.types.ints.positive;
         default = 300;
@@ -254,7 +234,6 @@ let
   mountEscapedNames = map escapedName (builtins.attrNames cfg.mounts);
   syncEscapedNames = map escapedName (builtins.attrNames cfg.syncs);
   syncDirectories = map (sync: sync.localDirectory) syncs;
-  managedSyncs = lib.filterAttrs (_name: sync: sync.createLocalDirectory) cfg.syncs;
   mountPoints = map (mount: mount.mountPoint) mounts;
 in
 {
@@ -306,28 +285,6 @@ in
         group = "mediastub";
         description = "mediastub service";
       };
-
-      systemd.tmpfiles.settings."10-mediastub" =
-        (lib.mapAttrs' (
-          _name: mount:
-          lib.nameValuePair mount.mountPoint {
-            d = {
-              mode = "0750";
-              user = mount.user;
-              group = mount.group;
-            };
-          }
-        ) cfg.mounts)
-        // (lib.mapAttrs' (
-          _name: sync:
-          lib.nameValuePair sync.localDirectory {
-            d = {
-              mode = sync.directoryMode;
-              user = if sync.directoryUser == null then sync.user else sync.directoryUser;
-              group = if sync.directoryGroup == null then sync.group else sync.directoryGroup;
-            };
-          }
-        ) managedSyncs);
 
       systemd.services =
         (lib.mapAttrs' mkMountService cfg.mounts) // (lib.mapAttrs' mkSyncService cfg.syncs);

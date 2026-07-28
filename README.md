@@ -109,7 +109,6 @@ services independently:
     syncs.movies = {
       remote = "https://drive.example/dav/movies";
       localDirectory = "/srv/media/movies";
-      createLocalDirectory = true;
       environmentFile = config.sops.secrets.mediastub-movies.path;
       consumers = [ "jellyfin.service" ];
       group = "media";
@@ -122,11 +121,10 @@ services independently:
 ```
 
 Mount services run as the module-created `mediastub:mediastub` system account
-by default and do not use `--allow-other`. The module creates the mountpoint,
-enables the NixOS FUSE support, and waits until each mount is ready. `consumers`
-contains systemd service names that require the mount and are ordered after it;
-it has no service-specific defaults. `user` and `group` can be overridden per
-mount.
+by default and do not use `--allow-other`. The module enables the NixOS FUSE
+support and waits until each mount is ready. `consumers` contains systemd
+service names that require the mount and are ordered after it; it has no
+service-specific defaults. `user` and `group` can be overridden per mount.
 
 `options` uses the same spelling as the CLI. Including `--allow-other` (or
 `--allow-other=true`) also enables `programs.fuse.userAllowOther`; this is
@@ -139,14 +137,10 @@ allow consumers to start after the initial remote/local scans have produced a
 work plan. Stub generation and sidecar transfers then continue in the active
 daemon. A scan or planning failure prevents readiness; transfer failures after
 readiness are logged and retried by later reconciles. The module creates the
-private state directory. Set
-`createLocalDirectory = true` to also create `localDirectory` with
-systemd-tmpfiles; `directoryMode` defaults to `2775` so new sidecars inherit the
-configured group. `directoryUser` and `directoryGroup` default to the sync
-service identity but can differ when, for example, the service needs a WebDAV
-socket group while the directory is shared through `media`. Leave directory
-creation disabled for paths managed by another filesystem or module. A
-sync-only configuration does not enable FUSE.
+private state directory. Users must provision each `mountPoint` and
+`localDirectory`, including the ownership and permissions needed by the
+configured service identities; the module does not add systemd-tmpfiles rules.
+A sync-only configuration does not enable FUSE.
 
 `environmentFile` is read at runtime by systemd. Basic authentication uses:
 

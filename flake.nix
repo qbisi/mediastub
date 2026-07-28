@@ -42,8 +42,6 @@
                 syncs.check = {
                   remote = "https://example.invalid/dav/media";
                   localDirectory = "/srv/media";
-                  createLocalDirectory = true;
-                  directoryGroup = "media";
                   environmentFile = "/run/secrets/mediastub";
                   consumers = [ "media-server.service" ];
                   group = "web";
@@ -86,14 +84,12 @@
           pkgs = evaluated.pkgs;
           unit = evaluated.config.systemd.units."mediastub-check.service".unit;
           syncUnit = evaluated.config.systemd.units."mediastub-sync-check.service".unit;
-          syncDirectory = syncOnly.config.systemd.tmpfiles.settings."10-mediastub"."/srv/media".d;
         in
         {
           module-eval =
             assert !syncOnly.config.programs.fuse.enable;
-            assert syncDirectory.mode == "2775";
-            assert syncDirectory.user == "mediastub";
-            assert syncDirectory.group == "media";
+            assert !(builtins.hasAttr "10-mediastub" evaluated.config.systemd.tmpfiles.settings);
+            assert !(builtins.hasAttr "10-mediastub" syncOnly.config.systemd.tmpfiles.settings);
             pkgs.runCommand "mediastub-module-eval" { } ''
               unit=${unit}/mediastub-check.service
               sync_unit=${syncUnit}/mediastub-sync-check.service
