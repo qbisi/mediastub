@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"mime"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -43,6 +45,18 @@ func (s *fileSource) ReadAt(p []byte, off int64) (int, error) { return s.file.Re
 
 func planHashString(hash [32]byte) string { return hex.EncodeToString(hash[:]) }
 
+func (s *Service) remoteObjectURL(rel string) string {
+	base := s.config.Remote
+	if cut := strings.IndexAny(base, "?#"); cut >= 0 {
+		base = base[:cut]
+	}
+	parts := strings.Split(rel, "/")
+	for i := range parts {
+		parts[i] = url.PathEscape(parts[i])
+	}
+	return strings.TrimRight(base, "/") + "/" + strings.Join(parts, "/")
+}
+
 func inspectLocalMarker(root, rel string, file localFile) (marker.Result, error) {
 	return marker.Inspect(filepath.Join(root, filepath.FromSlash(rel)), file.Size)
 }
@@ -55,7 +69,7 @@ func (s *Service) recordRemoteStub(rel string, remote origin.Entry, local localF
 	s.state.Media[rel] = MediaState{
 		Managed: true, Fingerprint: remote.Fingerprint(), ETag: remote.ETag, Size: remote.Size,
 		RemoteMTime: remote.ModTime, LocalMTime: time.Unix(0, local.ModTime), LocalSize: local.Size,
-		MarkerVersion: found.Version, PlanHash: planHashString(found.PlanHash), LastSeen: now,
+		PlanHash: planHashString(found.PlanHash), LastSeen: now,
 		Status: mediaRemoteStub,
 	}
 }
@@ -80,7 +94,7 @@ func (s *Service) materializeRemote(ctx context.Context, rel string, remote orig
 		s.state.Media[rel] = previous
 		return fmt.Errorf("probe remote media %q: %w", rel, err)
 	}
-	if err := materializePlan(ctx, s.config.LocalRoot, rel, result, remote.ETag, remote.ModTime); err != nil {
+	if err := materializePlan(ctx, s.config.LocalRoot, rel, result, remote.ETag, s.remoteObjectURL(rel), remote.ModTime); err != nil {
 		previous := s.state.Media[rel]
 		previous.Status, previous.LastError = mediaStubFailed, err.Error()
 		s.state.Media[rel] = previous
@@ -198,7 +212,7 @@ func (s *Service) finalizeUploadedMedia(ctx context.Context, rel string, local l
 		}
 		return nil
 	}
-	if err := materializePlanGuarded(ctx, s.config.LocalRoot, rel, probe, remote.ETag, remote.ModTime, beforeRename); err != nil {
+	if err := materializePlanGuarded(ctx, s.config.LocalRoot, rel, probe, remote.ETag, s.remoteObjectURL(rel), remote.ModTime, beforeRename); err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			s.recordPreservedMedia(rel, remote, current, transaction, now)
 			s.snapshot.Entries[rel] = remote

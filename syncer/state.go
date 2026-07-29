@@ -22,19 +22,18 @@ type State struct {
 }
 
 type MediaState struct {
-	Managed       bool      `json:"managed"`
-	Fingerprint   string    `json:"fingerprint"`
-	ETag          string    `json:"etag,omitempty"`
-	Size          int64     `json:"size"`
-	RemoteMTime   time.Time `json:"remoteMtime"`
-	LocalMTime    time.Time `json:"localMtime"`
-	LocalSize     int64     `json:"localSize"`
-	MarkerVersion uint16    `json:"markerVersion,omitempty"`
-	PlanHash      string    `json:"planHash,omitempty"`
-	LastSeen      time.Time `json:"lastSeen"`
-	Status        string    `json:"status"`
-	LastError     string    `json:"lastError,omitempty"`
-	Transaction   string    `json:"transaction,omitempty"`
+	Managed     bool      `json:"managed"`
+	Fingerprint string    `json:"fingerprint"`
+	ETag        string    `json:"etag,omitempty"`
+	Size        int64     `json:"size"`
+	RemoteMTime time.Time `json:"remoteMtime"`
+	LocalMTime  time.Time `json:"localMtime"`
+	LocalSize   int64     `json:"localSize"`
+	PlanHash    string    `json:"planHash,omitempty"`
+	LastSeen    time.Time `json:"lastSeen"`
+	Status      string    `json:"status"`
+	LastError   string    `json:"lastError,omitempty"`
+	Transaction string    `json:"transaction,omitempty"`
 }
 
 type SidecarState struct {

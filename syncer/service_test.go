@@ -64,15 +64,22 @@ func requireXattrs(t *testing.T) {
 	if err := os.WriteFile(name, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := unix.Setxattr(name, marker.XattrName, []byte{1}, 0)
+	err := unix.Setxattr(name, marker.FormatXattr, []byte{1}, 0)
 	if errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.ENOTSUP) {
 		t.Skip("test filesystem does not support user xattrs")
 	}
 	if err != nil {
 		t.Fatalf("probe user xattr support: %v", err)
 	}
-	if err := unix.Removexattr(name, marker.XattrName); err != nil {
+	if err := unix.Removexattr(name, marker.FormatXattr); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRemoteObjectURL(t *testing.T) {
+	service := &Service{config: Config{Remote: "https://example.test/dav/media/?token=secret"}}
+	if got, want := service.remoteObjectURL("Movies/A B/movie #1.mkv"), "https://example.test/dav/media/Movies/A%20B/movie%20%231.mkv"; got != want {
+		t.Fatalf("remoteObjectURL = %q, want %q", got, want)
 	}
 }
 
@@ -378,10 +385,6 @@ func TestReadOnlyMediaUploadsButStubReplacementIsSkipped(t *testing.T) {
 func TestLocalMediaProbeFailurePreservesFile(t *testing.T) {
 	requireXattrs(t)
 	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
-	remoteMedia := testMP4()
-	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), remoteMedia, 0o644); err != nil {
-		t.Fatal(err)
-	}
 	localMedia := []byte("not media")
 	localName := filepath.Join(localDir, "movie.mp4")
 	if err := os.WriteFile(localName, localMedia, 0o644); err != nil {
@@ -402,8 +405,8 @@ func TestLocalMediaProbeFailurePreservesFile(t *testing.T) {
 	if got, err := os.ReadFile(localName); err != nil || string(got) != string(localMedia) {
 		t.Fatalf("failed upload changed local file: %q, %v", got, err)
 	}
-	if got, err := os.ReadFile(filepath.Join(remoteDir, "movie.mp4")); err != nil || string(got) != string(remoteMedia) {
-		t.Fatalf("failed upload changed remote file: size=%d, %v", len(got), err)
+	if _, err := os.Stat(filepath.Join(remoteDir, "movie.mp4")); !os.IsNotExist(err) {
+		t.Fatalf("failed probe created remote file: %v", err)
 	}
 }
 
@@ -736,7 +739,7 @@ func TestInvalidMarkerIsPreserved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Setxattr(localName, marker.XattrName, []byte("broken"), 0); err != nil {
+	if err := unix.Setxattr(localName, marker.FormatXattr, []byte("broken"), 0); err != nil {
 		t.Fatal(err)
 	}
 	runOnce(t, upstream, remote, localDir, stateDir)

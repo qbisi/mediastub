@@ -1,23 +1,25 @@
-// Package marker stores and recognizes mediastub metadata in a user xattr.
+// Package marker stores and recognizes mediastub metadata in readable user xattrs.
 package marker
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/crc32"
+	"strconv"
+	"strings"
 
 	"github.com/qbisi/mediastub/core"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	// XattrName is the only marker recognized by mediastub.
-	XattrName = "user.mediastub"
-	Version   = uint16(1)
-
-	valueSize = 2 + 2 + 2 + 2 + 8 + 32 + 32 + 4
+	XattrPrefix     = "user.mediastub."
+	FormatXattr     = XattrPrefix + "format"
+	RemoteSizeXattr = XattrPrefix + "remote_size"
+	ETagHashXattr   = XattrPrefix + "etag_hash"
+	PlanHashXattr   = XattrPrefix + "plan_hash"
+	WebDAVURLXattr  = XattrPrefix + "webdav_url"
 )
 
 type Status uint8
@@ -29,12 +31,10 @@ const (
 )
 
 type Marker struct {
-	Version         uint16
-	Flags           uint16
-	RemoteSize      uint64
-	RemoteETagHash  [32]byte
-	PlanHash        [32]byte
-	PayloadChecksum uint32
+	RemoteSize     uint64
+	RemoteETagHash [32]byte
+	PlanHash       [32]byte
+	WebDAVURL      string
 }
 
 type Result struct {
@@ -45,112 +45,109 @@ type Result struct {
 
 func ETagHash(etag string) [32]byte { return sha256.Sum256([]byte(etag)) }
 
-func formatID(format core.Format) (uint16, error) {
-	switch format {
-	case core.FormatMatroska:
-		return 1, nil
-	case core.FormatMP4:
-		return 2, nil
-	default:
-		return 0, fmt.Errorf("unsupported marker format %q", format)
-	}
+func validFormat(format core.Format) bool {
+	return format == core.FormatMatroska || format == core.FormatMP4
 }
 
-func parseFormat(id uint16) (core.Format, bool) {
-	switch id {
-	case 1:
-		return core.FormatMatroska, true
-	case 2:
-		return core.FormatMP4, true
-	default:
-		return "", false
-	}
-}
-
-func value(format core.Format, remoteSize int64, etag string, planHash [32]byte) ([]byte, error) {
+// Set writes all marker fields to a temporary stub before it is published.
+func Set(path string, format core.Format, remoteSize int64, etag string, planHash [32]byte, webDAVURL string) error {
 	if remoteSize < 0 {
-		return nil, errors.New("negative marker remote size")
+		return errors.New("negative marker remote size")
 	}
-	id, err := formatID(format)
-	if err != nil {
-		return nil, err
+	if !validFormat(format) {
+		return fmt.Errorf("unsupported marker format %q", format)
 	}
-	out := make([]byte, valueSize)
-	binary.BigEndian.PutUint16(out[0:2], Version)
-	binary.BigEndian.PutUint16(out[4:6], id)
-	binary.BigEndian.PutUint64(out[8:16], uint64(remoteSize))
-	hash := ETagHash(etag)
-	copy(out[16:48], hash[:])
-	copy(out[48:80], planHash[:])
-	binary.BigEndian.PutUint32(out[80:84], crc32.ChecksumIEEE(out[:80]))
-	return out, nil
-}
-
-// Set writes a complete marker to XattrName. The target must already have its
-// final logical size; callers should set the xattr before publishing the file.
-func Set(path string, format core.Format, remoteSize int64, etag string, planHash [32]byte) error {
-	encoded, err := value(format, remoteSize, etag, planHash)
-	if err != nil {
-		return err
+	if webDAVURL == "" {
+		return errors.New("empty marker WebDAV URL")
 	}
-	if err := unix.Setxattr(path, XattrName, encoded, 0); err != nil {
-		return fmt.Errorf("set %s: %w", XattrName, err)
+	etagHash := ETagHash(etag)
+	values := []struct {
+		name  string
+		value string
+	}{
+		{FormatXattr, string(format)},
+		{RemoteSizeXattr, strconv.FormatInt(remoteSize, 10)},
+		{ETagHashXattr, hex.EncodeToString(etagHash[:])},
+		{PlanHashXattr, hex.EncodeToString(planHash[:])},
+		{WebDAVURLXattr, webDAVURL},
+	}
+	for _, field := range values {
+		if err := unix.Setxattr(path, field.name, []byte(field.value), 0); err != nil {
+			return fmt.Errorf("set %s: %w", field.name, err)
+		}
 	}
 	return nil
 }
 
-func readXattr(path string) ([]byte, bool, error) {
-	size, err := unix.Getxattr(path, XattrName, nil)
-	if errors.Is(err, unix.ENODATA) {
-		return nil, false, nil
+func missingXattr(err error) bool {
+	return err != nil && (errors.Is(err, unix.ENODATA) || strings.Contains(err.Error(), "attribute not found"))
+}
+
+func readXattr(path, name string) (string, bool, error) {
+	size, err := unix.Getxattr(path, name, nil)
+	if missingXattr(err) {
+		return "", false, nil
 	}
 	if err != nil {
-		return nil, false, fmt.Errorf("read %s size: %w", XattrName, err)
-	}
-	if size == 0 {
-		return nil, true, nil
+		return "", false, fmt.Errorf("read %s size: %w", name, err)
 	}
 	buf := make([]byte, size)
-	n, err := unix.Getxattr(path, XattrName, buf)
+	n, err := unix.Getxattr(path, name, buf)
 	if err != nil {
-		return nil, true, fmt.Errorf("read %s: %w", XattrName, err)
+		return "", true, fmt.Errorf("read %s: %w", name, err)
 	}
-	return buf[:n], true, nil
+	return string(buf[:n]), true, nil
 }
 
-func parseValue(encoded []byte, fileSize int64) Result {
-	result := Result{Status: InvalidMarker}
-	if len(encoded) != valueSize {
-		return result
-	}
-	result.Marker.Version = binary.BigEndian.Uint16(encoded[0:2])
-	result.Marker.Flags = binary.BigEndian.Uint16(encoded[2:4])
-	format, formatOK := parseFormat(binary.BigEndian.Uint16(encoded[4:6]))
-	result.Format = format
-	result.Marker.RemoteSize = binary.BigEndian.Uint64(encoded[8:16])
-	copy(result.Marker.RemoteETagHash[:], encoded[16:48])
-	copy(result.Marker.PlanHash[:], encoded[48:80])
-	result.Marker.PayloadChecksum = binary.BigEndian.Uint32(encoded[80:84])
-	if result.Marker.Version != Version || !formatOK ||
-		result.Marker.PayloadChecksum != crc32.ChecksumIEEE(encoded[:80]) ||
-		result.Marker.RemoteSize != uint64(fileSize) {
-		return result
-	}
-	result.Status = ValidMarker
-	return result
-}
-
-// Inspect recognizes only XattrName. A file without this xattr is real media.
+// Inspect requires the complete field set. A partial set is an invalid marker.
 func Inspect(path string, fileSize int64) (Result, error) {
 	if fileSize < 0 {
 		return Result{}, errors.New("negative file size")
 	}
-	encoded, present, err := readXattr(path)
-	if err != nil {
-		return Result{}, err
+	names := []string{FormatXattr, RemoteSizeXattr, ETagHashXattr, PlanHashXattr, WebDAVURLXattr}
+	values := make(map[string]string, len(names))
+	present := 0
+	for _, name := range names {
+		value, found, err := readXattr(path, name)
+		if err != nil {
+			return Result{}, err
+		}
+		if found {
+			present++
+			values[name] = value
+		}
 	}
-	if !present {
+	if present == 0 {
 		return Result{Status: NoMarker}, nil
 	}
-	return parseValue(encoded, fileSize), nil
+	result := Result{Status: InvalidMarker}
+	if present != len(names) {
+		return result, nil
+	}
+	format := core.Format(values[FormatXattr])
+	if !validFormat(format) {
+		return result, nil
+	}
+	size, err := strconv.ParseUint(values[RemoteSizeXattr], 10, 64)
+	if err != nil || size != uint64(fileSize) {
+		return result, nil
+	}
+	etagHash, err := hex.DecodeString(values[ETagHashXattr])
+	if err != nil || len(etagHash) != sha256.Size {
+		return result, nil
+	}
+	planHash, err := hex.DecodeString(values[PlanHashXattr])
+	if err != nil || len(planHash) != sha256.Size {
+		return result, nil
+	}
+	result.Format = format
+	result.Marker.RemoteSize = size
+	copy(result.Marker.RemoteETagHash[:], etagHash)
+	copy(result.Marker.PlanHash[:], planHash)
+	result.Marker.WebDAVURL = values[WebDAVURLXattr]
+	if result.Marker.WebDAVURL == "" {
+		return result, nil
+	}
+	result.Status = ValidMarker
+	return result, nil
 }

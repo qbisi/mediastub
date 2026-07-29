@@ -22,7 +22,7 @@ func TestMaterializePlanCreatesSparseReadOnlyFile(t *testing.T) {
 	}
 	mtime := time.Unix(100, 0)
 	result := &core.Result{Format: core.FormatMatroska, Plan: plan}
-	if err := materializePlan(context.Background(), root, "dir/movie.mkv", result, `"etag"`, mtime); err != nil {
+	if err := materializePlan(context.Background(), root, "dir/movie.mkv", result, `"etag"`, "https://example.test/dav/dir/movie.mkv", mtime); err != nil {
 		t.Fatal(err)
 	}
 	name := filepath.Join(root, "dir", "movie.mkv")
@@ -63,7 +63,7 @@ func TestMaterializePlanGuardPreservesTarget(t *testing.T) {
 	}
 	guardErr := errors.New("still processing")
 	result := &core.Result{Format: core.FormatMatroska, Plan: plan}
-	err = materializePlanGuarded(context.Background(), root, "movie.mkv", result, `"etag"`, time.Time{}, func() error {
+	err = materializePlanGuarded(context.Background(), root, "movie.mkv", result, `"etag"`, "https://example.test/dav/movie.mkv", time.Time{}, func() error {
 		return guardErr
 	})
 	if !errors.Is(err, guardErr) {

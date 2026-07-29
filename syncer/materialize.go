@@ -50,11 +50,11 @@ func randomSuffix() string {
 	return hex.EncodeToString(b[:])
 }
 
-func materializePlan(ctx context.Context, root, rel string, result *core.Result, remoteETag string, mtime time.Time) error {
-	return materializePlanGuarded(ctx, root, rel, result, remoteETag, mtime, nil)
+func materializePlan(ctx context.Context, root, rel string, result *core.Result, remoteETag, webDAVURL string, mtime time.Time) error {
+	return materializePlanGuarded(ctx, root, rel, result, remoteETag, webDAVURL, mtime, nil)
 }
 
-func materializePlanGuarded(ctx context.Context, root, rel string, result *core.Result, remoteETag string, mtime time.Time, beforeRename func() error) error {
+func materializePlanGuarded(ctx context.Context, root, rel string, result *core.Result, remoteETag, webDAVURL string, mtime time.Time, beforeRename func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -85,7 +85,14 @@ func materializePlanGuarded(ctx context.Context, root, rel string, result *core.
 		}
 	}
 	if err == nil {
-		err = marker.Set(tmp, result.Format, result.Plan.Size(), remoteETag, result.Plan.Hash())
+		err = marker.Set(tmp, result.Format, result.Plan.Size(), remoteETag, result.Plan.Hash(), webDAVURL)
+	}
+	if err == nil {
+		var inspected marker.Result
+		inspected, err = marker.Inspect(tmp, result.Plan.Size())
+		if err == nil && inspected.Status != marker.ValidMarker {
+			err = fmt.Errorf("verify temporary stub marker: status=%d", inspected.Status)
+		}
 	}
 	if err == nil {
 		err = f.Sync()

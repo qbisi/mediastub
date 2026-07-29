@@ -295,12 +295,25 @@ uses a fresh metadata deadline. The corresponding NixOS sync options are
 For every included remote Matroska or MP4 object, sync probes the remote using a
 fixed 16 MiB / 128 request / 256 KiB window budget and atomically creates a
 read-only ordinary sparse file whose logical size equals the remote media size.
-Stub metadata is stored only in the `user.mediastub` extended attribute, including
-the marker version, container format, remote size, hashed ETag, sparse-plan hash
-and checksum. The local filesystem must support and preserve `user.*` xattrs.
+Stub metadata is stored as readable `user.mediastub.*` extended attributes:
+`format`, `remote_size`, `etag_hash`, `plan_hash`, and `webdav_url`. The URL is
+derived from the configured remote and excludes query parameters. No marker
+version field is currently written. All fields are added to the same temporary
+stub before its atomic rename, and a missing field makes the marker invalid.
+The local filesystem must support and preserve `user.*` xattrs.
 A valid marker is never uploaded; an invalid marker is preserved and reported.
 File contents and historical trailer formats are not inspected for marker data.
 No upload handoff, keep, or coordination xattrs are read or written.
+
+`getfattr -d -m 'user.mediastub.*' FILE` therefore produces readable output:
+
+```text
+user.mediastub.format="matroska"
+user.mediastub.remote_size="123456789"
+user.mediastub.etag_hash="..."
+user.mediastub.plan_hash="..."
+user.mediastub.webdav_url="https://example.test/dav/media/movie.mkv"
+```
 
 An included local media file without a marker is treated as a completed download.
 It is uploaded only when the remote object does not exist. Sync waits until
@@ -511,7 +524,7 @@ archives should be reviewed as intentional fixture updates.
 
 - `core`: container detection and immutable sparse read plans; standard library
   only, and unaware of filesystems or HTTP.
-- `marker`: `user.mediastub` xattr encoding and validation.
+- `marker`: readable `user.mediastub.*` xattr encoding and validation.
 - `origin`: the namespace and random-read contract, plus the optional object
   PUT extension, with `local` and `webdav` implementations.
 - `pathfilter`: include parsing and `path.Match` behavior shared by both modes.
