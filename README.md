@@ -98,6 +98,7 @@ services independently:
       mountPoint = "/data/H-Enc";
       environmentFile = config.sops.secrets.mediastub-h-enc.path;
       consumers = [ "jellyfin.service" ];
+      requires = [ "openlist.service" ];
       include = [ "*.mkv" "*.mp4" ];
       options = [
         "--allow-other"
@@ -111,6 +112,7 @@ services independently:
       localDirectory = "/srv/media/movies";
       environmentFile = config.sops.secrets.mediastub-movies.path;
       consumers = [ "jellyfin.service" ];
+      requires = [ "openlist.service" ];
       group = "media";
       include = [ "*.mkv" "*.mp4" ];
       pollInterval = 300;
@@ -119,6 +121,10 @@ services independently:
   };
 }
 ```
+
+`requires` adds both `Requires=` and `After=` relationships from the mediastub
+unit to dependencies such as `openlist.service`. `consumers` expresses the
+opposite relationship: listed services require mediastub and start after it.
 
 Mount services run as the module-created `mediastub:mediastub` system account
 by default and do not use `--allow-other`. The module enables the NixOS FUSE

@@ -57,6 +57,12 @@ let
       description = "Systemd services that require this service and are ordered after it.";
       example = [ "media-server.service" ];
     };
+    requires = lib.mkOption {
+      type = lib.types.listOf nonEmptyString;
+      default = [ ];
+      description = "Systemd services that this service requires and is ordered after.";
+      example = [ "openlist.service" ];
+    };
     include = includeOption;
   };
 
@@ -177,8 +183,9 @@ let
       wantedBy = [ "multi-user.target" ];
       requiredBy = map consumerUnit mount.consumers;
       before = map consumerUnit mount.consumers;
+      requires = map consumerUnit mount.requires;
       wants = lib.optionals (needsNetwork mount.remote) [ "network-online.target" ];
-      after = lib.optionals (needsNetwork mount.remote) [ "network-online.target" ];
+      after = (map consumerUnit mount.requires) ++ lib.optionals (needsNetwork mount.remote) [ "network-online.target" ];
       path = [ (builtins.dirOf config.security.wrapperDir) ];
       serviceConfig = {
         Type = "simple";
@@ -240,8 +247,9 @@ let
       wantedBy = [ "multi-user.target" ];
       requiredBy = map consumerUnit sync.consumers;
       before = map consumerUnit sync.consumers;
+      requires = map consumerUnit sync.requires;
       wants = lib.optionals (needsNetwork sync.remote) [ "network-online.target" ];
-      after = lib.optionals (needsNetwork sync.remote) [ "network-online.target" ];
+      after = (map consumerUnit sync.requires) ++ lib.optionals (needsNetwork sync.remote) [ "network-online.target" ];
       serviceConfig = {
         Type = "notify";
         NotifyAccess = "main";
