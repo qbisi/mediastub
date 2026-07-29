@@ -91,12 +91,17 @@ type mountOptions struct {
 }
 
 type syncOptions struct {
-	include      string
-	pollInterval time.Duration
-	settleTime   time.Duration
-	stateDir     string
-	logLevel     string
-	daemon       bool
+	include            string
+	pollInterval       time.Duration
+	settleTime         time.Duration
+	stateDir           string
+	logLevel           string
+	daemon             bool
+	metadataTimeout    time.Duration
+	rangeReadTimeout   time.Duration
+	putMinimumRate     byteSize
+	putTimeoutOverhead time.Duration
+	putTimeoutMax      time.Duration
 }
 
 func (o syncOptions) validate() error {
@@ -111,6 +116,12 @@ func (o syncOptions) validate() error {
 	}
 	if o.settleTime <= 0 {
 		return errors.New("--settle-time must be positive")
+	}
+	if o.metadataTimeout <= 0 || o.rangeReadTimeout <= 0 || o.putMinimumRate <= 0 || o.putTimeoutOverhead <= 0 || o.putTimeoutMax <= 0 {
+		return errors.New("WebDAV timeouts and --put-min-rate must be positive")
+	}
+	if o.putTimeoutMax < o.putTimeoutOverhead {
+		return errors.New("--put-timeout-max must be at least --put-timeout-overhead")
 	}
 	if o.logLevel != "info" && o.logLevel != "verbose" && o.logLevel != "debug" {
 		return errors.New("--log-level must be info, verbose or debug")
@@ -176,6 +187,12 @@ func parseSync(args []string, output io.Writer) (syncOptions, string, string, er
 	flags.StringVar(&opts.stateDir, "state-dir", "", "absolute directory for state.json and the process lock (required)")
 	flags.StringVar(&opts.logLevel, "log-level", "info", "logging detail: info, verbose or debug")
 	flags.BoolVar(&opts.daemon, "daemon", false, "continue applying the initial plan, then watch local changes and poll the remote")
+	flags.DurationVar(&opts.metadataTimeout, "metadata-timeout", 30*time.Second, "deadline for each WebDAV metadata request")
+	flags.DurationVar(&opts.rangeReadTimeout, "range-read-timeout", 2*time.Minute, "deadline for each WebDAV range read")
+	opts.putMinimumRate = 256 << 10
+	flags.Var(&opts.putMinimumRate, "put-min-rate", "minimum assumed PUT rate used to calculate its deadline")
+	flags.DurationVar(&opts.putTimeoutOverhead, "put-timeout-overhead", 2*time.Minute, "fixed overhead added to calculated PUT deadlines")
+	flags.DurationVar(&opts.putTimeoutMax, "put-timeout-max", 24*time.Hour, "maximum calculated PUT deadline")
 	flags.Usage = func() {
 		fmt.Fprintln(output, "Usage: mediastub sync [options] REMOTE LOCAL_DIRECTORY")
 		fmt.Fprintln(output, "Options may appear before or after REMOTE LOCAL_DIRECTORY.")
@@ -421,7 +438,10 @@ func syncCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	upstream, err := origin.NewRemoteWithAuth(remote, auth)
+	upstream, err := origin.NewRemoteWithAuthAndTimeouts(remote, auth, origin.Timeouts{
+		Metadata: opts.metadataTimeout, RangeRead: opts.rangeReadTimeout,
+		PutBase: opts.putTimeoutOverhead, PutMinimumRate: int64(opts.putMinimumRate), PutMaximum: opts.putTimeoutMax,
+	})
 	if err != nil {
 		return err
 	}

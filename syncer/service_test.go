@@ -296,9 +296,6 @@ func TestInitialReconcileAndSidecarRestore(t *testing.T) {
 
 func TestUntrackedLocalMediaUploadsAndBecomesStub(t *testing.T) {
 	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
-	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), testMP4(), 0o644); err != nil {
-		t.Fatal(err)
-	}
 	localMedia := append(append([]byte(nil), testMP4()...), []byte{0, 0, 0, 8, 'f', 'r', 'e', 'e'}...)
 	if err := os.WriteFile(filepath.Join(localDir, "movie.mp4"), localMedia, 0o644); err != nil {
 		t.Fatal(err)
@@ -317,21 +314,45 @@ func TestUntrackedLocalMediaUploadsAndBecomesStub(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0o444 || info.Size() != int64(len(localMedia)) {
 		t.Fatalf("uploaded media did not become a stub: %+v, %v", info, err)
 	}
-	uploadedStatus, _, err := marker.InspectUploaded(filepath.Join(localDir, "movie.mp4"), info.Size(), info.ModTime())
-	if err != nil || uploadedStatus != marker.NoMarker {
-		t.Fatalf("stub retained uploaded marker: status=%d, %v", uploadedStatus, err)
+}
+
+func TestExistingRemoteMediaIsNotOverwrittenByLocalMedia(t *testing.T) {
+	requireXattrs(t)
+	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
+	remoteMedia := testMP4()
+	localMedia := append(append([]byte(nil), remoteMedia...), []byte{0, 0, 0, 8, 'f', 'r', 'e', 'e'}...)
+	if err := os.WriteFile(filepath.Join(remoteDir, "movie.mp4"), remoteMedia, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "movie.mp4"), localMedia, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := origin.NewLocal(remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	runOnce(t, upstream, "file://"+remoteDir, localDir, stateDir)
+	got, err := os.ReadFile(filepath.Join(remoteDir, "movie.mp4"))
+	if err != nil || string(got) != string(remoteMedia) {
+		t.Fatalf("existing remote media was overwritten: size=%d, %v", len(got), err)
+	}
+	info, err := os.Stat(filepath.Join(localDir, "movie.mp4"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found, err := marker.Inspect(filepath.Join(localDir, "movie.mp4"), info.Size())
+	if err != nil || found.Status != marker.ValidMarker {
+		t.Fatalf("writable local media was not replaced with remote stub: %+v, %v", found, err)
 	}
 }
 
-func TestUploadedMediaWaitsForKeepXattr(t *testing.T) {
+func TestReadOnlyMediaUploadsButStubReplacementIsSkipped(t *testing.T) {
 	requireXattrs(t)
 	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
 	localMedia := testMP4()
 	localName := filepath.Join(localDir, "movie.mp4")
-	if err := os.WriteFile(localName, localMedia, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Setxattr(localName, marker.KeepXattrName, []byte("1"), 0); err != nil {
+	if err := os.WriteFile(localName, localMedia, 0o444); err != nil {
 		t.Fatal(err)
 	}
 	base, err := origin.NewLocal(remoteDir)
@@ -350,30 +371,7 @@ func TestUploadedMediaWaitsForKeepXattr(t *testing.T) {
 	}
 	stubMarker, err := marker.Inspect(localName, info.Size())
 	if err != nil || stubMarker.Status != marker.NoMarker {
-		t.Fatalf("blocked media was replaced with stub: %+v, %v", stubMarker, err)
-	}
-	uploadedStatus, _, err := marker.InspectUploaded(localName, info.Size(), info.ModTime())
-	if err != nil || uploadedStatus != marker.ValidMarker {
-		t.Fatalf("uploaded marker = %d, %v", uploadedStatus, err)
-	}
-	blockers, err := marker.BlockingUserXattrs(localName)
-	if err != nil || len(blockers) != 1 || blockers[0] != marker.KeepXattrName {
-		t.Fatalf("blockers = %v, %v", blockers, err)
-	}
-	if err := unix.Removexattr(localName, marker.KeepXattrName); err != nil {
-		t.Fatal(err)
-	}
-	noPut := &putOverrideOrigin{Origin: base, put: func(context.Context, string, io.Reader, int64, string) (origin.Entry, error) {
-		return origin.Entry{}, errors.New("uploaded media must not be uploaded again")
-	}}
-	runOnce(t, noPut, remote, localDir, stateDir)
-	info, err = os.Stat(localName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	stubMarker, err = marker.Inspect(localName, info.Size())
-	if err != nil || stubMarker.Status != marker.ValidMarker {
-		t.Fatalf("media did not become stub after blocker removal: %+v, %v", stubMarker, err)
+		t.Fatalf("read-only media was replaced with stub: %+v, %v", stubMarker, err)
 	}
 }
 
@@ -467,6 +465,59 @@ func TestMediaVerifyFailurePreservesRealFile(t *testing.T) {
 	}
 	if got, err := os.ReadFile(localName); err != nil || string(got) != string(localMedia) {
 		t.Fatalf("verification failure changed local media: size=%d, %v", len(got), err)
+	}
+}
+
+func TestMediaVerifyFailureRecoversWithStatWithoutSecondPut(t *testing.T) {
+	for _, stage := range []origin.PutStage{origin.PutStageVerify, origin.PutStageResponse} {
+		t.Run(string(stage), func(t *testing.T) {
+			requireXattrs(t)
+			remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
+			localMedia := testMP4()
+			localName := filepath.Join(localDir, "movie.mp4")
+			if err := os.WriteFile(localName, localMedia, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			base, err := origin.NewLocal(remoteDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer base.Close()
+			puts := 0
+			upstream := &putOverrideOrigin{Origin: base, put: func(ctx context.Context, rel string, source io.Reader, size int64, contentType string) (origin.Entry, error) {
+				puts++
+				_, err := base.Put(ctx, rel, source, size, contentType)
+				if err != nil {
+					return origin.Entry{}, err
+				}
+				return origin.Entry{}, &origin.PutError{Stage: stage, Err: errors.New("temporary PUT outcome failure")}
+			}}
+			config := Config{Remote: "file://" + remoteDir, LocalRoot: localDir, StateDir: stateDir, Includes: []string{"*.mp4"}, PollInterval: time.Second, SettleTime: time.Millisecond, Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0)}
+			service, err := New(upstream, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.Run(context.Background(), nil); err == nil {
+				t.Fatal("PUT outcome failure was ignored")
+			}
+			service, err = New(upstream, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.Run(context.Background(), nil); err != nil {
+				t.Fatalf("recovery reconcile: %v", err)
+			}
+			if puts != 1 {
+				t.Fatalf("PUT calls = %d, want 1", puts)
+			}
+			found, err := marker.Inspect(localName, int64(len(localMedia)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if found.Status != marker.ValidMarker {
+				t.Fatalf("recovered media marker status = %v", found.Status)
+			}
+		})
 	}
 }
 
@@ -702,79 +753,6 @@ func TestInvalidMarkerIsPreserved(t *testing.T) {
 	defer store.Close()
 	if state.Media["movie.mp4"].Status != mediaInvalidMarker {
 		t.Fatalf("invalid marker state = %+v", state.Media["movie.mp4"])
-	}
-}
-
-func TestDaemonFinalizesUploadedMediaAfterBlockerRemoval(t *testing.T) {
-	requireXattrs(t)
-	remoteDir, localDir := t.TempDir(), t.TempDir()
-	localName := filepath.Join(localDir, "movie.mp4")
-	if err := os.WriteFile(localName, testMP4(), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Setxattr(localName, marker.KeepXattrName, []byte("1"), 0); err != nil {
-		t.Fatal(err)
-	}
-	upstream, err := origin.NewLocal(remoteDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer upstream.Close()
-	service, err := New(upstream, Config{
-		Remote: "file://" + remoteDir, LocalRoot: localDir, StateDir: t.TempDir(),
-		Includes: []string{"*.mp4"}, PollInterval: time.Hour, SettleTime: 10 * time.Millisecond,
-		Daemon: true, Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	ready := make(chan struct{})
-	go func() { done <- service.Run(ctx, func(string) error { close(ready); return nil }) }()
-	select {
-	case <-ready:
-	case <-time.After(3 * time.Second):
-		cancel()
-		t.Fatal("daemon did not become ready")
-	}
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		info, statErr := os.Stat(localName)
-		if statErr == nil {
-			status, _, inspectErr := marker.InspectUploaded(localName, info.Size(), info.ModTime())
-			if inspectErr == nil && status == marker.ValidMarker {
-				break
-			}
-		}
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatal("media was not marked uploaded")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err := unix.Removexattr(localName, marker.KeepXattrName); err != nil {
-		cancel()
-		t.Fatal(err)
-	}
-	deadline = time.Now().Add(3 * time.Second)
-	for {
-		info, statErr := os.Stat(localName)
-		if statErr == nil {
-			result, inspectErr := marker.Inspect(localName, info.Size())
-			if inspectErr == nil && result.Status == marker.ValidMarker {
-				break
-			}
-		}
-		if time.Now().After(deadline) {
-			cancel()
-			t.Fatal("media was not replaced after blocker removal")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
 	}
 }
 

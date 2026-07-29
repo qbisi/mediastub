@@ -277,34 +277,41 @@ The state directory is mandatory, must be absolute, and is locked so two
 processes cannot use it simultaneously. Its `Remote` and `LocalRoot` identity
 must continue to match subsequent invocations.
 
+WebDAV uses request-level deadlines rather than an `http.Client` total timeout.
+Metadata requests default to `--metadata-timeout=30s`, range reads to
+`--range-read-timeout=2m`, and each PUT deadline is calculated as
+`--put-timeout-overhead=2m` plus the object size divided by
+`--put-min-rate=256KiB`, capped by `--put-timeout-max=24h`. PUT verification
+uses a fresh metadata deadline. The corresponding NixOS sync options are
+`metadataTimeout`, `rangeReadTimeout`, `putMinimumRate`,
+`putTimeoutOverhead`, and `putTimeoutMax`.
+
 For every included remote Matroska or MP4 object, sync probes the remote using a
 fixed 16 MiB / 128 request / 256 KiB window budget and atomically creates a
 read-only ordinary sparse file whose logical size equals the remote media size.
-Stub metadata is stored in the `user.mediastub` extended attribute, including
+Stub metadata is stored only in the `user.mediastub` extended attribute, including
 the marker version, container format, remote size, hashed ETag, sparse-plan hash
 and checksum. The local filesystem must support and preserve `user.*` xattrs.
 A valid marker is never uploaded; an invalid marker is preserved and reported.
 File contents and historical trailer formats are not inspected for marker data.
+No upload handoff, keep, or coordination xattrs are read or written.
 
 An included local media file without a marker is treated as a completed download.
-Sync waits until inode, size and mtime are stable, probes it only to prepare the
-future stub, and PUTs it directly to the final remote path. After PUT it verifies
-only remote size and the presence of an ETag. It does not calculate a complete
-media hash or read the uploaded media back. Only then is the real local inode
-marked with `user.uploaded`. Unless `user.keep` is present, the file is
-immediately and atomically replaced by a marked sparse stub. `user.keep` keeps
-the uploaded real file in place; daemon mode retries after the attribute is
-removed, and one-shot mode retries on its next run. Other user, system, security,
-and ACL xattrs do not block replacement. The uploaded marker records
-the local size and mtime plus the verified remote ETag; an invalid marker or a
-missing or changed remote object causes a new upload. Probe, upload, verification
-or stub-generation failure preserves the real local file.
+It is uploaded only when the remote object does not exist. Sync waits until
+inode, size and mtime are stable, probes it only to prepare the future stub,
+PUTs it to the final remote path, and verifies remote size plus the presence of
+an ETag. It does not calculate a complete media hash or read the uploaded media
+back. When the remote already exists, the local media is never uploaded.
+A writable unmarked local media file is atomically replaced with a marked sparse
+stub; a non-writable file is preserved and the skipped replacement is logged
+without failing reconciliation. Probe, upload, verification or stub-generation
+failure preserves the real local file.
 
 Downloaders must replace the stub with an atomic rename. Truncating and rewriting
 the existing inode is unsupported because that operation preserves its xattr
 marker.
 
-Recognized sidecars must share a directory and stem with a managed media file:
+Recognized sidecars must share a directory and stem with an existing media file:
 
 - exact `<stem>.nfo`;
 - common Jellyfin image forms such as `<stem>.jpg`, `-poster`, `-cover`,

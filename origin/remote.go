@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const remoteHTTPTimeout = 2 * time.Minute
-
 // NewRemote constructs an Origin from a file, HTTP(S) WebDAV or Unix-socket
 // WebDAV URL. WebDAV credentials are supplied separately so they never need to
 // appear in the URL or process arguments.
@@ -23,11 +21,16 @@ func NewRemote(remote, user, password string) (Origin, error) {
 
 // NewRemoteWithAuth constructs an Origin using explicit WebDAV authentication.
 func NewRemoteWithAuth(remote string, auth Auth) (Origin, error) {
+	return NewRemoteWithAuthAndTimeouts(remote, auth, DefaultTimeouts)
+}
+
+// NewRemoteWithAuthAndTimeouts constructs a remote with request-level timeout policy.
+func NewRemoteWithAuthAndTimeouts(remote string, auth Auth, timeouts Timeouts) (Origin, error) {
 	if err := auth.Validate(); err != nil {
 		return nil, err
 	}
 	if strings.HasPrefix(remote, "http+unix://") {
-		return newUnixWebDAVWithAuth(remote, auth)
+		return newUnixWebDAVWithAuthAndTimeouts(remote, auth, timeouts)
 	}
 	u, err := url.Parse(remote)
 	if err != nil {
@@ -52,14 +55,21 @@ func NewRemoteWithAuth(remote string, auth Auth) (Origin, error) {
 		if u.Host == "" {
 			return nil, errors.New("HTTP(S) WebDAV remote requires a host")
 		}
-		return newOwnedWebDAVWithAuth(u.String(), auth, defaultHTTPTransport())
+		return newOwnedWebDAVWithAuthAndTimeouts(u.String(), auth, defaultHTTPTransport(), timeouts)
 	default:
 		return nil, fmt.Errorf("unsupported remote scheme %q; want file, http, https or http+unix", u.Scheme)
 	}
 }
 
 func defaultHTTPTransport() *http.Transport {
-	return http.DefaultTransport.(*http.Transport).Clone()
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout: 10 * time.Second, KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = 0
+	transport.IdleConnTimeout = 90 * time.Second
+	return transport
 }
 
 func newUnixWebDAV(remote, user, password string) (Origin, error) {
@@ -67,7 +77,11 @@ func newUnixWebDAV(remote, user, password string) (Origin, error) {
 }
 
 func newUnixWebDAVWithAuth(remote string, auth Auth) (Origin, error) {
-	return newUnixWebDAVWithNetworkTransportAuth(remote, auth, defaultHTTPTransport())
+	return newUnixWebDAVWithAuthAndTimeouts(remote, auth, DefaultTimeouts)
+}
+
+func newUnixWebDAVWithAuthAndTimeouts(remote string, auth Auth, timeouts Timeouts) (Origin, error) {
+	return newUnixWebDAVWithNetworkTransportAuthAndTimeouts(remote, auth, defaultHTTPTransport(), timeouts)
 }
 
 func newUnixWebDAVWithNetworkTransport(remote, user, password string, networkTransport *http.Transport) (Origin, error) {
@@ -75,6 +89,10 @@ func newUnixWebDAVWithNetworkTransport(remote, user, password string, networkTra
 }
 
 func newUnixWebDAVWithNetworkTransportAuth(remote string, auth Auth, networkTransport *http.Transport) (Origin, error) {
+	return newUnixWebDAVWithNetworkTransportAuthAndTimeouts(remote, auth, networkTransport, DefaultTimeouts)
+}
+
+func newUnixWebDAVWithNetworkTransportAuthAndTimeouts(remote string, auth Auth, networkTransport *http.Transport, timeouts Timeouts) (Origin, error) {
 	remainder := strings.TrimPrefix(remote, "http+unix://")
 	separator := strings.IndexAny(remainder, "/?#")
 	if separator < 0 {
@@ -114,7 +132,7 @@ func newUnixWebDAVWithNetworkTransportAuth(remote string, auth Auth, networkTran
 	transport := &redirectTransport{
 		unixHost: base.Host, unix: unixTransport, network: networkTransport,
 	}
-	return newOwnedWebDAVWithAuth(base.String(), auth, transport)
+	return newOwnedWebDAVWithAuthAndTimeouts(base.String(), auth, transport, timeouts)
 }
 
 // redirectTransport sends requests for the synthetic WebDAV host over the
@@ -149,8 +167,12 @@ func newOwnedWebDAV(baseURL, user, password string, transport ownedTransport) (O
 }
 
 func newOwnedWebDAVWithAuth(baseURL string, auth Auth, transport ownedTransport) (Origin, error) {
-	client := &http.Client{Transport: transport, Timeout: remoteHTTPTimeout}
-	webdav, err := NewWebDAVWithAuth(baseURL, auth, client)
+	return newOwnedWebDAVWithAuthAndTimeouts(baseURL, auth, transport, DefaultTimeouts)
+}
+
+func newOwnedWebDAVWithAuthAndTimeouts(baseURL string, auth Auth, transport ownedTransport, timeouts Timeouts) (Origin, error) {
+	client := &http.Client{Transport: transport}
+	webdav, err := NewWebDAVWithAuthAndTimeouts(baseURL, auth, client, timeouts)
 	if err != nil {
 		transport.CloseIdleConnections()
 		return nil, err

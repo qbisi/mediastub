@@ -97,6 +97,31 @@ let
         default = 3;
         description = "Seconds a local media or sidecar file must remain unchanged before upload.";
       };
+      metadataTimeout = lib.mkOption {
+        type = nonEmptyString;
+        default = "30s";
+        description = "Deadline for each WebDAV metadata request.";
+      };
+      rangeReadTimeout = lib.mkOption {
+        type = nonEmptyString;
+        default = "2m";
+        description = "Deadline for each WebDAV range read.";
+      };
+      putMinimumRate = lib.mkOption {
+        type = nonEmptyString;
+        default = "256KiB";
+        description = "Minimum assumed upload rate used to calculate PUT deadlines.";
+      };
+      putTimeoutOverhead = lib.mkOption {
+        type = nonEmptyString;
+        default = "2m";
+        description = "Fixed overhead added to calculated PUT deadlines.";
+      };
+      putTimeoutMax = lib.mkOption {
+        type = nonEmptyString;
+        default = "24h";
+        description = "Maximum calculated PUT deadline.";
+      };
       logLevel = lib.mkOption {
         type = lib.types.enum [
           "info"
@@ -194,6 +219,11 @@ let
           "--poll-interval=${toString sync.pollInterval}s"
           "--settle-time=${toString sync.settleTime}s"
           "--log-level=${sync.logLevel}"
+          "--metadata-timeout=${sync.metadataTimeout}"
+          "--range-read-timeout=${sync.rangeReadTimeout}"
+          "--put-min-rate=${sync.putMinimumRate}"
+          "--put-timeout-overhead=${sync.putTimeoutOverhead}"
+          "--put-timeout-max=${sync.putTimeoutMax}"
         ]
         ++ includeArgs sync.include
         ++ [

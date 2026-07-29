@@ -189,7 +189,7 @@ func (s *Service) planWork(local map[string]localFile) (mediaCount, sidecarCount
 		needsWork := false
 		switch {
 		case localExists:
-			localChanged := !known || previous.LocalSize != lf.Size || !previous.LocalMTime.Equal(time.Unix(0, lf.ModTime)) || previous.Status == "local-dirty" || previous.Status == "upload-failed"
+			localChanged := !known || previous.LocalSize != lf.Size || !previous.LocalMTime.Equal(time.Unix(0, lf.ModTime)) || previous.Status == "local-dirty" || previous.Status == "upload-failed" || previous.Status == "verification-pending" || previous.Status == "outcome-unknown"
 			remoteChanged := !remoteExists || !known || previous.RemoteETag != remoteEntry.ETag || previous.RemoteSize != remoteEntry.Size || !previous.RemoteMTime.Equal(remoteEntry.ModTime)
 			needsWork = localChanged || remoteChanged || (remoteExists && remoteEntry.ETag == "")
 		case remoteExists || known:
@@ -222,10 +222,8 @@ func (s *Service) duplicateBlocked(rel string) bool {
 
 func (s *Service) trackedMediaPaths() []string {
 	var paths []string
-	for rel, media := range s.state.Media {
-		if media.Managed {
-			paths = append(paths, rel)
-		}
+	for rel := range s.state.Media {
+		paths = append(paths, rel)
 	}
 	sort.Strings(paths)
 	return paths
@@ -294,6 +292,30 @@ func (s *Service) reconcileSidecars(ctx context.Context, local map[string]localF
 				actionErrors = append(actionErrors, fmt.Errorf("settle sidecar %q: %w", rel, err))
 				continue
 			}
+			if known && (previous.Status == "verification-pending" || previous.Status == "outcome-unknown") {
+				recovered, statErr := s.origin.Stat(ctx, rel)
+				switch {
+				case statErr == nil && recovered.Size == stableFile.Size && recovered.ETag != "":
+					remoteEntry, remoteExists = recovered, true
+					s.snapshot.Entries[rel] = recovered
+					previous.LastUploadedSHA256 = localHash
+					previous.RemoteETag, previous.RemoteSize, previous.RemoteMTime = recovered.ETag, recovered.Size, recovered.ModTime
+					s.logf("info", "sidecar upload recovered path=%q remote_size=%d remote_etag_present=true retry_action=stat", rel, recovered.Size)
+				case errors.Is(statErr, origin.ErrNotFound):
+					remoteExists = false
+				case statErr != nil:
+					previous.LastError = statErr.Error()
+					s.state.Sidecars[rel] = previous
+					actionErrors = append(actionErrors, fmt.Errorf("recover uncertain sidecar upload %q: %w", rel, statErr))
+					continue
+				default:
+					err := fmt.Errorf("remote sidecar conflict: size=%d want=%d etag_present=%t", recovered.Size, stableFile.Size, recovered.ETag != "")
+					previous.LastError = err.Error()
+					s.state.Sidecars[rel] = previous
+					actionErrors = append(actionErrors, err)
+					continue
+				}
+			}
 			needUpload := !remoteExists
 			if !known && remoteExists {
 				remoteHash, err := hashRemote(ctx, s.origin, remoteEntry)
@@ -316,8 +338,18 @@ func (s *Service) reconcileSidecars(ctx context.Context, local map[string]localF
 			if needUpload {
 				entry, err := s.uploadAndVerify(ctx, rel, stableFile, localHash)
 				if err != nil {
-					s.state.Sidecars[rel] = SidecarState{LocalSHA256: localHash, LocalSize: stableFile.Size, LocalMTime: time.Unix(0, stableFile.ModTime), LastUploadedSHA256: previous.LastUploadedSHA256, RemoteETag: previous.RemoteETag, RemoteSize: previous.RemoteSize, RemoteMTime: previous.RemoteMTime, MediaPath: mediaFor[rel], Status: "upload-failed", LastError: err.Error()}
-					s.logf("info", "sidecar upload failed path=%q error=%v", rel, err)
+					status, stage := "upload-failed", "put"
+					var putErr *origin.PutError
+					if errors.As(err, &putErr) {
+						stage = string(putErr.Stage)
+						if putErr.Stage == origin.PutStageVerify {
+							status = "verification-pending"
+						} else {
+							status = "outcome-unknown"
+						}
+					}
+					s.state.Sidecars[rel] = SidecarState{LocalSHA256: localHash, LocalSize: stableFile.Size, LocalMTime: time.Unix(0, stableFile.ModTime), LastUploadedSHA256: previous.LastUploadedSHA256, RemoteETag: previous.RemoteETag, RemoteSize: previous.RemoteSize, RemoteMTime: previous.RemoteMTime, MediaPath: mediaFor[rel], Status: status, LastError: err.Error()}
+					s.logf("info", "sidecar upload failed path=%q stage=%s outcome=remote-may-exist local_preserved=true retry_action=stat error=%v", rel, stage, err)
 					actionErrors = append(actionErrors, fmt.Errorf("upload sidecar %q: %w", rel, err))
 					continue
 				}
@@ -429,13 +461,19 @@ func (s *Service) uploadAndVerify(ctx context.Context, rel string, file localFil
 	entry, putErr := s.mutable.Put(ctx, rel, f, file.Size, sidecarContentType(rel))
 	closeErr := f.Close()
 	if putErr != nil {
+		if closeErr != nil {
+			putErr = errors.Join(putErr, fmt.Errorf("close local upload source: %w", closeErr))
+		}
 		return origin.Entry{}, putErr
 	}
 	if closeErr != nil {
-		return origin.Entry{}, closeErr
+		s.logf("info", "sidecar upload source close warning path=%q error=%q remote_verified=true", rel, closeErr)
 	}
 	if entry.Size != file.Size || entry.ETag == "" {
-		return origin.Entry{}, fmt.Errorf("verify sidecar upload: size=%d want=%d etag_present=%t", entry.Size, file.Size, entry.ETag != "")
+		return origin.Entry{}, &origin.PutError{
+			Stage: origin.PutStageVerify,
+			Err:   fmt.Errorf("verify sidecar upload: size=%d want=%d etag_present=%t", entry.Size, file.Size, entry.ETag != ""),
+		}
 	}
 	return entry, nil
 }

@@ -12,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const propfindBody = `<?xml version="1.0" encoding="utf-8"?>
@@ -19,9 +20,24 @@ const propfindBody = `<?xml version="1.0" encoding="utf-8"?>
 
 // WebDAV exposes a WebDAV collection as a mutable Origin.
 type WebDAV struct {
-	base   *url.URL
-	client *http.Client
-	auth   Auth
+	base     *url.URL
+	client   *http.Client
+	auth     Auth
+	timeouts Timeouts
+}
+
+// Timeouts controls request deadlines without imposing a total HTTP client timeout.
+type Timeouts struct {
+	Metadata       time.Duration
+	RangeRead      time.Duration
+	PutBase        time.Duration
+	PutMinimumRate int64
+	PutMaximum     time.Duration
+}
+
+var DefaultTimeouts = Timeouts{
+	Metadata: 30 * time.Second, RangeRead: 2 * time.Minute,
+	PutBase: 2 * time.Minute, PutMinimumRate: 256 << 10, PutMaximum: 24 * time.Hour,
 }
 
 // NewWebDAV constructs a WebDAV origin. baseURL may include a collection path.
@@ -31,6 +47,11 @@ func NewWebDAV(baseURL, user, password string, client *http.Client) (*WebDAV, er
 
 // NewWebDAVWithAuth constructs a WebDAV origin using Basic, Bearer or no authentication.
 func NewWebDAVWithAuth(baseURL string, auth Auth, client *http.Client) (*WebDAV, error) {
+	return NewWebDAVWithAuthAndTimeouts(baseURL, auth, client, DefaultTimeouts)
+}
+
+// NewWebDAVWithAuthAndTimeouts constructs a WebDAV origin with request-level deadlines.
+func NewWebDAVWithAuthAndTimeouts(baseURL string, auth Auth, client *http.Client, timeouts Timeouts) (*WebDAV, error) {
 	if err := auth.Validate(); err != nil {
 		return nil, err
 	}
@@ -60,7 +81,39 @@ func NewWebDAVWithAuth(baseURL string, auth Auth, client *http.Client) (*WebDAV,
 		}
 		return nil
 	}
-	return &WebDAV{base: base, client: &clientCopy, auth: auth}, nil
+	timeouts = normalizeTimeouts(timeouts)
+	return &WebDAV{base: base, client: &clientCopy, auth: auth, timeouts: timeouts}, nil
+}
+
+func normalizeTimeouts(t Timeouts) Timeouts {
+	if t.Metadata <= 0 {
+		t.Metadata = DefaultTimeouts.Metadata
+	}
+	if t.RangeRead <= 0 {
+		t.RangeRead = DefaultTimeouts.RangeRead
+	}
+	if t.PutBase <= 0 {
+		t.PutBase = DefaultTimeouts.PutBase
+	}
+	if t.PutMinimumRate <= 0 {
+		t.PutMinimumRate = DefaultTimeouts.PutMinimumRate
+	}
+	if t.PutMaximum <= 0 {
+		t.PutMaximum = DefaultTimeouts.PutMaximum
+	}
+	return t
+}
+
+func (w *WebDAV) putTimeout(size int64) time.Duration {
+	seconds := size / w.timeouts.PutMinimumRate
+	if size%w.timeouts.PutMinimumRate != 0 {
+		seconds++
+	}
+	timeout := w.timeouts.PutBase + time.Duration(seconds)*time.Second
+	if timeout > w.timeouts.PutMaximum {
+		return w.timeouts.PutMaximum
+	}
+	return timeout
 }
 
 func sameOrigin(a, b *url.URL) bool {
@@ -191,6 +244,8 @@ func (w *WebDAV) propfind(ctx context.Context, rel, depth string) ([]Entry, erro
 
 // Stat returns metadata for rel using a Depth: 0 PROPFIND.
 func (w *WebDAV) Stat(ctx context.Context, rel string) (Entry, error) {
+	ctx, cancel := context.WithTimeout(ctx, w.timeouts.Metadata)
+	defer cancel()
 	clean, err := CleanPath(rel)
 	if err != nil {
 		return Entry{}, err
@@ -209,6 +264,8 @@ func (w *WebDAV) Stat(ctx context.Context, rel string) (Entry, error) {
 
 // ReadDir lists direct children using a Depth: 1 PROPFIND.
 func (w *WebDAV) ReadDir(ctx context.Context, rel string) ([]Entry, error) {
+	ctx, cancel := context.WithTimeout(ctx, w.timeouts.Metadata)
+	defer cancel()
 	clean, err := CleanPath(rel)
 	if err != nil {
 		return nil, err
@@ -244,18 +301,51 @@ func (w *WebDAV) Open(ctx context.Context, entry Entry) (Object, error) {
 	return &webDAVObject{origin: w, entry: entry}, nil
 }
 
-// Put writes an object directly to its final WebDAV path.
-func (w *WebDAV) Put(ctx context.Context, rel string, src io.Reader, size int64, contentType string) (Entry, error) {
+type PutStage string
+
+const (
+	PutStageTransfer PutStage = "transfer"
+	PutStageResponse PutStage = "response"
+	PutStageVerify   PutStage = "verify"
+)
+
+type PutError struct {
+	Stage PutStage
+	Err   error
+}
+
+func (e *PutError) Error() string { return fmt.Sprintf("WebDAV PUT stage=%s: %v", e.Stage, e.Err) }
+func (e *PutError) Unwrap() error { return e.Err }
+
+type nonClosingReader struct{ io.Reader }
+
+func (nonClosingReader) Close() error { return nil }
+
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
+}
+
+func (w *WebDAV) putObject(ctx context.Context, rel string, src io.Reader, size int64, contentType string) error {
 	clean, err := CleanPath(rel)
 	if err != nil {
-		return Entry{}, err
+		return err
 	}
 	if clean == "." || size < 0 {
-		return Entry{}, errors.New("invalid WebDAV PUT target or size")
+		return errors.New("invalid WebDAV PUT target or size")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.objectURL(clean).String(), src)
+	counted := &countingReader{r: src}
+	// net/http closes request bodies. Keep ownership of the caller's reader by
+	// exposing a no-op Close at the transport boundary.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, w.objectURL(clean).String(), nonClosingReader{Reader: counted})
 	if err != nil {
-		return Entry{}, err
+		return err
 	}
 	w.request(req)
 	req.ContentLength = size
@@ -264,14 +354,37 @@ func (w *WebDAV) Put(ctx context.Context, rel string, src io.Reader, size int64,
 	}
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return Entry{}, sanitizeURLError(err)
+		stage := PutStageTransfer
+		if counted.n >= size {
+			stage = PutStageResponse
+		}
+		return &PutError{Stage: stage, Err: sanitizeURLError(err)}
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusNoContent {
-		return Entry{}, webDAVStatusError(resp.StatusCode, resp.Status)
+		return &PutError{Stage: PutStageResponse, Err: webDAVStatusError(resp.StatusCode, resp.Status)}
 	}
-	return w.Stat(ctx, clean)
+	return nil
+}
+
+// Put writes an object and verifies it with a fresh metadata deadline.
+func (w *WebDAV) Put(ctx context.Context, rel string, src io.Reader, size int64, contentType string) (Entry, error) {
+	putCtx, cancelPut := context.WithTimeout(ctx, w.putTimeout(size))
+	err := w.putObject(putCtx, rel, src, size, contentType)
+	cancelPut()
+	if err != nil {
+		var putErr *PutError
+		if errors.As(err, &putErr) {
+			return Entry{}, err
+		}
+		return Entry{}, &PutError{Stage: PutStageTransfer, Err: err}
+	}
+	entry, err := w.Stat(ctx, rel)
+	if err != nil {
+		return Entry{}, &PutError{Stage: PutStageVerify, Err: err}
+	}
+	return entry, nil
 }
 
 // Close does not close a caller-owned HTTP client.
@@ -283,6 +396,8 @@ type webDAVObject struct {
 }
 
 func (o *webDAVObject) ReadAt(ctx context.Context, p []byte, off int64) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, o.origin.timeouts.RangeRead)
+	defer cancel()
 	if len(p) == 0 {
 		return 0, nil
 	}

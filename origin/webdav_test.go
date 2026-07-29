@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestWebDAVPropfindAndRangeRead(t *testing.T) {
@@ -151,6 +153,127 @@ func TestWebDAVBearerPutAndStat(t *testing.T) {
 	}
 	if string(content) != string(want) || entry.Size != int64(len(want)) {
 		t.Fatalf("content=%q entry=%+v", content, entry)
+	}
+}
+
+func TestWebDAVPutDoesNotCloseCallerReader(t *testing.T) {
+	var content []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			content, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusCreated)
+		case "PROPFIND":
+			w.WriteHeader(http.StatusMultiStatus)
+			fmt.Fprint(w, multiStatus(davResponseXML("/movie.mkv", false, len(content))))
+		}
+	}))
+	defer server.Close()
+	name := t.TempDir() + "/movie.mkv"
+	if err := os.WriteFile(name, []byte("media"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webdav, err := NewWebDAV(server.URL+"/", "", "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := webdav.Put(context.Background(), "movie.mkv", file, 5, "video/x-matroska"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Stat(); err != nil {
+		t.Fatalf("caller reader was closed: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("caller close: %v", err)
+	}
+}
+
+func TestWebDAVPutMayExceedMetadataTimeout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			time.Sleep(120 * time.Millisecond)
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusCreated)
+		case "PROPFIND":
+			w.WriteHeader(http.StatusMultiStatus)
+			fmt.Fprint(w, multiStatus(davResponseXML("/movie.mkv", false, 1)))
+		}
+	}))
+	defer server.Close()
+	cfg := DefaultTimeouts
+	cfg.Metadata = 50 * time.Millisecond
+	cfg.PutBase = time.Second
+	webdav, err := NewWebDAVWithAuthAndTimeouts(server.URL+"/", Auth{}, server.Client(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := webdav.Put(context.Background(), "movie.mkv", strings.NewReader("x"), 1, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebDAVPutVerificationGetsFreshDeadline(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			time.Sleep(80 * time.Millisecond)
+			w.WriteHeader(http.StatusCreated)
+		case "PROPFIND":
+			time.Sleep(30 * time.Millisecond)
+			w.WriteHeader(http.StatusMultiStatus)
+			fmt.Fprint(w, multiStatus(davResponseXML("/empty", false, 0)))
+		}
+	}))
+	defer server.Close()
+	cfg := DefaultTimeouts
+	cfg.Metadata = 50 * time.Millisecond
+	cfg.PutBase = 100 * time.Millisecond
+	webdav, err := NewWebDAVWithAuthAndTimeouts(server.URL+"/", Auth{}, server.Client(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := webdav.Put(context.Background(), "empty", strings.NewReader(""), 0, ""); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPutStopsWhenParentContextIsCanceled(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(started)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	webdav, err := NewWebDAV(server.URL+"/", "", "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := webdav.Put(ctx, "movie.mkv", strings.NewReader("x"), 1, "")
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Put error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Put did not stop after cancellation")
 	}
 }
 

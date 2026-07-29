@@ -49,6 +49,7 @@ type Origin interface {
 
 // MutableOrigin is the optional write boundary used by media and sidecar synchronization.
 // Implementations publish directly to the requested path and return its metadata.
+// Put does not take ownership of src and must not close it.
 type MutableOrigin interface {
 	Origin
 	Put(ctx context.Context, path string, src io.Reader, size int64, contentType string) (Entry, error)
