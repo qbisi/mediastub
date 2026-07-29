@@ -2,6 +2,7 @@ package syncer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -117,4 +118,28 @@ func scanLocal(root string) (map[string]localFile, error) {
 		return nil
 	})
 	return files, err
+}
+
+func removeEmptyLocalDirs(root string) error {
+	var dirs []string
+	if err := filepath.WalkDir(root, func(localPath string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if localPath != root && entry.IsDir() {
+			dirs = append(dirs, localPath)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := os.Remove(dirs[i]); err != nil &&
+			!errors.Is(err, os.ErrNotExist) &&
+			!errors.Is(err, syscall.ENOTEMPTY) &&
+			!errors.Is(err, syscall.EEXIST) {
+			return err
+		}
+	}
+	return nil
 }

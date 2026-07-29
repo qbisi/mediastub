@@ -95,6 +95,43 @@ func runOnce(t *testing.T, upstream origin.Origin, remote, local, state string) 
 	}
 }
 
+func TestReconcileRemovesEmptyLocalSubdirectories(t *testing.T) {
+	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
+	emptyDir := filepath.Join(localDir, "shows", "empty-season")
+	keptDir := filepath.Join(localDir, "shows", "kept-season")
+	if err := os.MkdirAll(emptyDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(keptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(keptDir, "notes.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	upstream, err := origin.NewLocal(remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	service, err := New(upstream, Config{
+		Remote: "file://" + remoteDir, LocalRoot: localDir, StateDir: stateDir,
+		Includes: []string{"*.mp4"}, PollInterval: time.Second, SettleTime: time.Millisecond,
+		Budget: core.DefaultBudget, Logger: log.New(io.Discard, "", 0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Run(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(emptyDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty subdirectory still exists: %v", err)
+	}
+	if _, err := os.Stat(keptDir); err != nil {
+		t.Fatalf("non-empty subdirectory was removed: %v", err)
+	}
+}
+
 func TestReadyAfterPlanningBeforeApply(t *testing.T) {
 	requireXattrs(t)
 	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()

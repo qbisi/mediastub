@@ -3,10 +3,40 @@ package syncer
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/qbisi/mediastub/origin"
 )
+
+func TestRemoveEmptyLocalDirs(t *testing.T) {
+	root := t.TempDir()
+	emptyLeaf := filepath.Join(root, "empty", "nested")
+	nonEmpty := filepath.Join(root, "kept")
+	if err := os.MkdirAll(emptyLeaf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nonEmpty, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nonEmpty, "movie.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := removeEmptyLocalDirs(root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "empty")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty directory still exists: %v", err)
+	}
+	if _, err := os.Stat(nonEmpty); err != nil {
+		t.Fatalf("non-empty directory was removed: %v", err)
+	}
+	if _, err := os.Stat(root); err != nil {
+		t.Fatalf("local root was removed: %v", err)
+	}
+}
 
 type scanOrigin struct {
 	dirs map[string][]origin.Entry

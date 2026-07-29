@@ -136,7 +136,10 @@ func (s *Service) scanInputs(ctx context.Context, refreshRemote bool) (map[strin
 	return local, nil
 }
 
-func (s *Service) applyReconcile(ctx context.Context, local map[string]localFile, remoteScan bool) error {
+func (s *Service) applyReconcile(ctx context.Context, local map[string]localFile, remoteScan bool) (result error) {
+	defer func() {
+		result = errors.Join(result, removeEmptyLocalDirs(s.config.LocalRoot))
+	}()
 	mediaErr := s.reconcileMediaFiles(ctx, local, remoteScan)
 	// Persist ownership of newly published stubs before sidecar I/O. Otherwise
 	// a later failure could make a valid stub look like an untracked collision.
