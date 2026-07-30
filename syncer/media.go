@@ -34,7 +34,6 @@ const (
 	mediaInvalidMarker       = "invalid-marker"
 	mediaRemoteMissing       = "remote-missing"
 	mediaDuplicateRemote     = "duplicate-remote-path"
-	subripXattr              = "user.subrip"
 )
 
 type fileSource struct {
@@ -76,38 +75,18 @@ func (s *Service) recordRemoteStub(rel string, remote origin.Entry, local localF
 	}
 }
 
-func writableMedia(file localFile) bool { return file.Mode.Perm()&0o222 != 0 }
-
-func replacementBlockReason(root, rel string, file localFile) string {
-	if !writableMedia(file) {
-		return "local-not-writable"
-	}
+func writableMedia(root, rel string) bool {
 	filename := filepath.Join(root, filepath.FromSlash(rel))
-	size, err := unix.Getxattr(filename, subripXattr, nil)
-	if errors.Is(err, unix.ENODATA) || (err != nil && strings.Contains(err.Error(), "attribute not found")) {
-		return ""
-	}
-	if err != nil {
-		return "user.subrip-unreadable"
-	}
-	value := make([]byte, size)
-	n, err := unix.Getxattr(filename, subripXattr, value)
-	if err != nil {
-		return "user.subrip-unreadable"
-	}
-	if strings.EqualFold(strings.TrimSpace(string(value[:n])), "true") {
-		return "user.subrip"
-	}
-	return ""
+	return unix.Access(filename, unix.W_OK) == nil
 }
 
-func (s *Service) recordReadOnlyMedia(rel string, remote origin.Entry, local localFile, reason string, now time.Time) {
+func (s *Service) recordReadOnlyMedia(rel string, remote origin.Entry, local localFile, now time.Time) {
 	s.state.Media[rel] = MediaState{
 		Managed: false, Fingerprint: remote.Fingerprint(), ETag: remote.ETag, Size: remote.Size,
 		RemoteMTime: remote.ModTime, LocalMTime: time.Unix(0, local.ModTime), LocalSize: local.Size,
 		LastSeen: now, Status: mediaLocalReadOnly,
 	}
-	s.logf("info", "media stub replacement skipped path=%q reason=%s outcome=ignored local_preserved=true", rel, reason)
+	s.logf("info", "media stub replacement skipped path=%q reason=local-not-writable outcome=ignored local_preserved=true", rel)
 }
 
 func (s *Service) materializeRemote(ctx context.Context, rel string, remote origin.Entry, now time.Time) error {
@@ -194,10 +173,10 @@ func (s *Service) recordPreservedMedia(rel string, remote origin.Entry, local lo
 
 func (s *Service) finalizeUploadedMedia(ctx context.Context, rel string, local localFile, remote origin.Entry, transaction string, now time.Time, probe *core.Result) error {
 	filename := filepath.Join(s.config.LocalRoot, filepath.FromSlash(rel))
-	if reason := replacementBlockReason(s.config.LocalRoot, rel, local); reason != "" {
+	if !writableMedia(s.config.LocalRoot, rel) {
 		s.recordPreservedMedia(rel, remote, local, transaction, now)
 		s.snapshot.Entries[rel] = remote
-		s.logf("info", "media stub replacement skipped transaction=%q path=%q reason=%s outcome=ignored remote_verified=true local_preserved=true", transaction, rel, reason)
+		s.logf("info", "media stub replacement skipped transaction=%q path=%q reason=local-not-writable outcome=ignored remote_verified=true local_preserved=true", transaction, rel)
 		return nil
 	}
 	current, err := statLocal(s.config.LocalRoot, rel)
@@ -232,20 +211,16 @@ func (s *Service) finalizeUploadedMedia(ctx context.Context, rel string, local l
 		if !sameLocalFile(current, latest) {
 			return errors.New("local file changed before stub replacement")
 		}
-		if replacementBlockReason(s.config.LocalRoot, rel, latest) != "" {
+		if !writableMedia(s.config.LocalRoot, rel) {
 			return os.ErrPermission
 		}
 		return nil
 	}
 	if err := materializePlanGuarded(ctx, s.config.LocalRoot, rel, probe, remote.ETag, s.remoteObjectURL(rel), remote.ModTime, beforeRename); err != nil {
 		if errors.Is(err, os.ErrPermission) {
-			reason := replacementBlockReason(s.config.LocalRoot, rel, current)
-			if reason == "" {
-				reason = "local-not-writable"
-			}
 			s.recordPreservedMedia(rel, remote, current, transaction, now)
 			s.snapshot.Entries[rel] = remote
-			s.logf("info", "media stub replacement skipped transaction=%q path=%q reason=%s outcome=ignored remote_verified=true local_preserved=true", transaction, rel, reason)
+			s.logf("info", "media stub replacement skipped transaction=%q path=%q reason=local-not-writable outcome=ignored remote_verified=true local_preserved=true", transaction, rel)
 			return nil
 		}
 		previous := s.state.Media[rel]
@@ -518,8 +493,8 @@ func (s *Service) reconcileMediaFiles(ctx context.Context, local map[string]loca
 			s.logf("info", "invalid-marker path=%q", rel)
 		case marker.NoMarker:
 			if remoteExists {
-				if reason := replacementBlockReason(s.config.LocalRoot, rel, file); reason != "" {
-					s.recordReadOnlyMedia(rel, remote, file, reason, now)
+				if !writableMedia(s.config.LocalRoot, rel) {
+					s.recordReadOnlyMedia(rel, remote, file, now)
 					continue
 				}
 				if err := s.materializeRemote(ctx, rel, remote, now); err != nil {
@@ -533,8 +508,8 @@ func (s *Service) reconcileMediaFiles(ctx context.Context, local map[string]loca
 			switch {
 			case statErr == nil:
 				s.snapshot.Entries[rel] = remote
-				if reason := replacementBlockReason(s.config.LocalRoot, rel, file); reason != "" {
-					s.recordReadOnlyMedia(rel, remote, file, reason, now)
+				if !writableMedia(s.config.LocalRoot, rel) {
+					s.recordReadOnlyMedia(rel, remote, file, now)
 				} else if err := s.materializeRemote(ctx, rel, remote, now); err != nil {
 					actionErrors = append(actionErrors, err)
 				}

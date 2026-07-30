@@ -303,9 +303,7 @@ stub before its atomic rename, and a missing field makes the marker invalid.
 The local filesystem must support and preserve `user.*` xattrs.
 A valid marker is never uploaded; an invalid marker is preserved and reported.
 File contents and historical trailer formats are not inspected for marker data.
-An unmarked local media file with `user.subrip=true` is uploaded normally but
-is not replaced with a stub. No other upload handoff or keep xattrs are read or
-written.
+No upload handoff, keep, or coordination xattrs are read or written.
 
 `getfattr -d -m 'user.mediastub.*' FILE` therefore produces readable output:
 
@@ -323,12 +321,13 @@ inode, size and mtime are stable, probes it only to prepare the future stub,
 PUTs it to the final remote path, and verifies remote size plus the presence of
 an ETag. It does not calculate a complete media hash or read the uploaded media
 back. When the remote already exists, the local media is never uploaded.
-A writable unmarked local media file is atomically replaced with a marked sparse
-stub; a non-writable file is preserved and the skipped replacement is logged
-without failing reconciliation. A file marked with `user.subrip=true` is also
-preserved after upload so another service can generate subtitles from the real
-media. Probe, upload, verification or stub-generation failure preserves the
-real local file.
+An unmarked local media file writable by the sync service's runtime user and
+groups is atomically replaced with a marked sparse stub. Writability is checked
+using the process access rules, including ownership, group membership and ACLs,
+instead of merely checking whether any mode write bit is present. A file that
+is only readable by the service is preserved and the skipped replacement is
+logged without failing reconciliation. Probe, upload, verification or
+stub-generation failure preserves the real local file.
 
 Downloaders must replace the stub with an atomic rename. Truncating and rewriting
 the existing inode is unsupported because that operation preserves its xattr

@@ -419,40 +419,6 @@ func TestReadOnlyMediaUploadsButStubReplacementIsSkipped(t *testing.T) {
 	}
 }
 
-func TestSubripMediaUploadsButStubReplacementIsSkipped(t *testing.T) {
-	requireXattrs(t)
-	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
-	localMedia := testMP4()
-	localName := filepath.Join(localDir, "movie.mp4")
-	if err := os.WriteFile(localName, localMedia, 0o640); err != nil {
-		t.Fatal(err)
-	}
-	if err := unix.Setxattr(localName, subripXattr, []byte("true"), 0); err != nil {
-		t.Fatal(err)
-	}
-	base, err := origin.NewLocal(remoteDir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer base.Close()
-	remote := "file://" + remoteDir
-	runOnce(t, base, remote, localDir, stateDir)
-	if got, err := os.ReadFile(filepath.Join(remoteDir, "movie.mp4")); err != nil || string(got) != string(localMedia) {
-		t.Fatalf("local media was not uploaded: size=%d, %v", len(got), err)
-	}
-	info, err := os.Stat(localName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode().Perm() != 0o640 {
-		t.Fatalf("subrip media mode = %o, want 640", info.Mode().Perm())
-	}
-	stubMarker, err := marker.Inspect(localName, info.Size())
-	if err != nil || stubMarker.Status != marker.NoMarker {
-		t.Fatalf("subrip media was replaced with stub: %+v, %v", stubMarker, err)
-	}
-}
-
 func TestLocalMediaProbeFailurePreservesFile(t *testing.T) {
 	requireXattrs(t)
 	remoteDir, localDir, stateDir := t.TempDir(), t.TempDir(), t.TempDir()
